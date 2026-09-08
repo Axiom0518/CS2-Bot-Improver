@@ -13,13 +13,14 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 
 namespace BotState;
 
 public class BotState : BasePlugin
 {
     public override string ModuleName => "Smarter-Bot";
-    public override string ModuleVersion => "1.9.4";
+    public override string ModuleVersion => "1.10.5";
     public override string ModuleAuthor => "ed0ard & XBribo & unicbm";
     public override string ModuleDescription => "Make bots smarter";
 
@@ -154,19 +155,73 @@ public class BotState : BasePlugin
     private const float FlashFovHorizDeg = 110f;        // bot horizontal cone (full angle)
     private const float FlashFovVertDeg = 90f;         // bot vertical cone (full angle)
     private const float FlashMatchSlackSeconds = 0.25f;
-    private readonly Dictionary<uint, float> _flashThrownAt = new();   // flash entindex -> server time first seen
-    private readonly Dictionary<int, HashSet<uint>> _flashRolledByBot = new(); // bot idx  -> evaluated flashes
+    // Human: perceive/decide ~200–230ms (bots slightly slower so not sweaty).
+    private const float FlashPerceiveDelayMin = 0.20f;
+    private const float FlashPerceiveDelayMax = 0.26f;
+    // Physical flick window before boom ~120–150ms (slightly wider).
+    private const float FlashTurnLeadMin = 0.13f;
+    private const float FlashTurnLeadMax = 0.17f;
+    // Late panic: still flick if notice leaves ≥ this much before boom.
+    private const float FlashPanicMinWindow = 0.08f;
+    private const float FlashPanicLeadMin = 0.08f;
+    private const float FlashPanicLeadMax = 0.12f;
+    // Stay looking away through the boom, then spend a clear window looking back.
+    // (Old hold 50–90ms felt like "already returning at pop".)
+    private const float FlashHoldAfterBoomMin = 0.10f;
+    private const float FlashHoldAfterBoomMax = 0.16f;
+    private const float FlashLookBackMin = 0.12f;
+    private const float FlashLookBackMax = 0.18f;
+    // Panic: trust engine BlindDuration only (already shortened by partial turn).
+    // Do not apply a second facingScale multiply — that made ~0.3s blinds feel too light.
+    // ~90–150° in the flick window — often partial, not god-tier 180°.
+    private const float FlashTurnYawDegPerSecMin = 750f;
+    private const float FlashTurnYawDegPerSecMax = 950f;
+    private const float FlashTurnPitchDegPerSec = 450f;
+    // Align with BotVision config defaults / ball-smoke (native density call disabled —
+    // CSS MemoryFunction float/VectorWS ABI was returning garbage ~3e9).
+    private const float FlashSmokeDefaultDensityThreshold = 0.23f;
+    private const float FlashSmokeBallRadius = 150f;
+    // Require a thick chord through smoke to hide a projectile (grazing edges still visible).
+    private const float FlashSmokeMinBlockChord = 100f;
 
-    // Per-(bot, flash) decision shared by the native blind hook and OnPlayerBlind
+    private float _smokeDensityThreshold = FlashSmokeDefaultDensityThreshold;
+    private readonly List<(float X, float Y, float Z)> _activeSmokeCenters = new();
+
+    private readonly Dictionary<uint, float> _flashThrownAt = new();
+    // Track sight + late/panic turn. Blindness at boom = facing geometry (no dice).
     private struct FlashDecision
     {
         public float FirstSeen;
         public float LastSeen;
         public float DetonateAt;
-        public bool Avoided;
+        public float TurnStartAt;
+        public float LookBackStart;
+        public float LookBackEnd;
+        public float PerceiveDelay;
+        public float TurnLead;
+        public float YawSpeed;
+        public bool CanAvoid;
+        public bool IsPanic;
+        public bool BlindApplied; // boom scaled once; keep decision for look-back
+        public bool Turning;
+        public bool SavedCrouching;
+        public bool HasSavedPose;
+        public float ReturnYaw;
+        public float ReturnPitch;
+        public float FlashX;
+        public float FlashY;
+        public float FlashZ;
+        public float RemainingAtSight;   // detonateAt - FirstSeen (for debug)
+        public float DebugHoldRaw;       // native Blind hold before scale
+        public float DebugHoldScaled;    // native Blind hold after scale
+        public bool DebugHoldSet;
     }
+
     private readonly Dictionary<(int bot, uint flash), FlashDecision> _flashDecisions = new();
     private readonly HashSet<(int bot, uint flash)> _flashRejectLogged = new();
+    private readonly HashSet<(int bot, uint flash)> _flashLookReleased = new();
+    // Bot index → hold still through flash flick / look-back (skip crouch/move hacks).
+    private readonly Dictionary<int, float> _flashPlantedUntil = new();
 
     // Debug logging (toggle with `css_botstate_flashdebug`)
     private bool _debugFlash = false;
@@ -176,6 +231,7 @@ public class BotState : BasePlugin
     {
         InstallDefuseBombHook();
         InstallBotBlindHook();
+        LoadBotVisionSmokeConfig();
         InitializeFovPatches();
         RegisterEventHandler<EventRoundStart>(OnRoundStart);
         RegisterEventHandler<EventPlayerHurt>(OnPlayerHurt);
@@ -197,6 +253,11 @@ public class BotState : BasePlugin
             1.0f,
             ReequipGunForActiveBots,
             CounterStrikeSharp.API.Modules.Timers.TimerFlags.REPEAT);
+
+        Console.WriteLine(
+            $"[Smarter-Bot] flash v{ModuleVersion} ready (panic + ball-smoke; thr={_smokeDensityThreshold:F2})");
+        Logger.LogInformation(
+            "[Smarter-Bot] flash v{Version} ready (panic + ball-smoke)", ModuleVersion);
     }
 
     // Resolves capabilities supplied by plugins after every plugin has loaded
@@ -239,6 +300,22 @@ public class BotState : BasePlugin
             p.PrintToConsole(msg);
         }
     }
+
+    // Unified flash debug line:
+    //   [Flash] #123 botName | STAGE | key=value ...
+    private void FlashLog(uint flashId, string? botName, string stage, string detail)
+    {
+        if (!_debugFlash) return;
+        string who = string.IsNullOrEmpty(botName) ? "-" : botName;
+        BroadcastDebug($"[Flash] #{flashId} {who} | {stage} | {detail}");
+    }
+
+    private static string FlashModeLabel(in FlashDecision d)
+    {
+        if (d.CanAvoid) return "full";
+        if (d.IsPanic) return "panic";
+        return "none";
+    }
     //---------------------------------------------------------------------------------------
     // Reveals whoever hurt a Bot to every Bot through smoke for 1 second.
     // Further damage from the same source only pushes the window out. Windows never stack.
@@ -256,6 +333,24 @@ public class BotState : BasePlugin
                 return HookResult.Continue;
 
             RevealThroughSmoke(attacker.Slot, HurtRevealSeconds);
+
+            // Humanlike: brief alert bump on taking damage (instead of perpetual alert wipe).
+            if (HumanlikeMode.Enabled)
+            {
+                var pawn = victim.PlayerPawn?.Value;
+                var bot = pawn?.Bot;
+                if (bot != null)
+                {
+                    float now = Server.CurrentTime;
+                    CountdownTimer alertTimer = bot.AlertTimer;
+                    ref float alertduration = ref alertTimer.Duration;
+                    alertduration = 3.0f;
+                    ref float alerttimestamp = ref alertTimer.Timestamp;
+                    alerttimestamp = now + alertduration;
+                    ref float alerttimescale = ref alertTimer.Timescale;
+                    alerttimescale = 1.0f;
+                }
+            }
         }
         catch { }
         return HookResult.Continue;
@@ -389,7 +484,7 @@ public class BotState : BasePlugin
 
         int bidx = (int)player.Index;
         float origBlind = @event.BlindDuration;
-        bool isImmune;
+        float blindScale = 1f;
 
         // Match this blind event to the bot's most-recently-detonating tracked flash
         float matchNow = Server.CurrentTime;
@@ -399,51 +494,77 @@ public class BotState : BasePlugin
             out (int bot, uint flash) matchedKey,
             out FlashDecision matched);
 
-        if (hasMatchedDecision)
+        var pawn = player.PlayerPawn?.Value;
+        if (hasMatchedDecision && pawn != null && pawn.IsValid)
         {
-            isImmune = matched.Avoided;
-            _flashDecisions.Remove(matchedKey);
-        }
-        else
-        {
-            // Bot never saw this flash through FOV+LOS — should be flashed normally
-            isImmune = false;
+            // Panic: engine already accounted for partial facing — pass through 100%.
+            // Full/none: our facingScale still refines (full can zero out near-back).
+            if (matched.IsPanic)
+            {
+                blindScale = 1f;
+            }
+            else
+            {
+                blindScale = ComputeFacingBlindScale(
+                    pawn, matched.FlashX, matched.FlashY, matched.FlashZ);
+            }
+            if (!matched.BlindApplied)
+            {
+                matched.BlindApplied = true;
+                _flashDecisions[matchedKey] = matched;
+            }
+            // Keep decision until look-back finishes (do not Remove here).
         }
 
-        if (isImmune)
+        if (blindScale < 0.99f && pawn != null && pawn.IsValid)
         {
-            @event.BlindDuration = 0f;
-            var pawn = player.PlayerPawn?.Value;
-            if (pawn != null && pawn.IsValid)
+            @event.BlindDuration = origBlind * blindScale;
+            if (blindScale <= 0.05f)
             {
                 ref float blindStartTime = ref pawn.BlindStartTime;
                 blindStartTime = 0f;
-
                 ref float blindUntilTime = ref pawn.BlindUntilTime;
                 blindUntilTime = 0f;
-
                 ref float flashDuration = ref pawn.FlashDuration;
                 flashDuration = 0f;
-
                 ref float flashMaxAlpha = ref pawn.FlashMaxAlpha;
                 flashMaxAlpha = 0f;
+                @event.BlindDuration = 0f;
+            }
+            else
+            {
+                ref float flashDuration = ref pawn.FlashDuration;
+                if (flashDuration > 0f) flashDuration *= blindScale;
+                ref float flashMaxAlpha = ref pawn.FlashMaxAlpha;
+                if (flashMaxAlpha > 0f) flashMaxAlpha *= Math.Clamp(blindScale + 0.1f, 0f, 1f);
+                ref float blindUntilTime = ref pawn.BlindUntilTime;
+                if (blindUntilTime > Server.CurrentTime)
+                {
+                    float remain = blindUntilTime - Server.CurrentTime;
+                    blindUntilTime = Server.CurrentTime + remain * blindScale;
+                }
             }
         }
 
         if (_debugFlash)
         {
-            string detail;
-            if (hasMatchedDecision)
-            {
-                float visibleMs = (matched.LastSeen - matched.FirstSeen) * 1000f;
-                detail = $"flash#{matchedKey.flash} visible={visibleMs:F0}ms rolled={(matched.Avoided ? "AVOID" : "flash")}";
-            }
-            else
-            {
-                detail = "no tracked flash (out of FOV / occluded entire flight)";
-            }
-            BroadcastDebug(
-                $"[Smarter-Bot/Flash] blind event bot={player.PlayerName} immune={isImmune} origDur={origBlind:F2}s ({detail})");
+            float effective = blindScale <= 0.05f ? 0f : origBlind * blindScale;
+            string mode = hasMatchedDecision ? FlashModeLabel(matched) : "untracked";
+            string holdPart = hasMatchedDecision && matched.DebugHoldSet
+                ? $" hold={matched.DebugHoldScaled:F2}s(of {matched.DebugHoldRaw:F2}s)"
+                : "";
+            string trackPart = hasMatchedDecision
+                ? $" track={(matched.LastSeen - matched.FirstSeen) * 1000f:F0}ms leftAtSee={matched.RemainingAtSight * 1000f:F0}ms turned={(matched.Turning ? "yes" : "no")}"
+                : " (never tracked: FOV/LOS/smoke whole flight)";
+            string scaleNote = hasMatchedDecision && matched.IsPanic
+                ? " (engine-only)"
+                : "";
+            string flashTag = hasMatchedDecision ? matchedKey.flash.ToString() : "?";
+            FlashLog(
+                hasMatchedDecision ? matchedKey.flash : 0,
+                player.PlayerName,
+                "BLIND",
+                $"flash#{flashTag} scale={blindScale * 100f:F0}%{scaleNote} eng={origBlind:F2}s effective≈{effective:F2}s{holdPart} mode={mode}{trackPart}");
         }
 
         return HookResult.Continue;
@@ -538,58 +659,90 @@ public class BotState : BasePlugin
             ref bool allowActive = ref bot.AllowActive;
             allowActive = true;
 
-            ref bool isRapidFiring = ref bot.IsRapidFiring;
-            isRapidFiring = true;
+            // Soft humanlike: keep combat readiness, but leave peripheral/panic/surprise
+            // so bots still have a reaction window (no instant lock).
+            if (HumanlikeMode.Enabled)
+            {
+                ref bool isRapidFiring = ref bot.IsRapidFiring;
+                isRapidFiring = true;
 
-            ref float peripheralTimestamp = ref bot.PeripheralTimestamp;
-            peripheralTimestamp = 0.0f;
+                ref float fireWeaponTimestamp = ref bot.FireWeaponTimestamp;
+                fireWeaponTimestamp = 0.0f;
 
-            ref float fireWeaponTimestamp = ref bot.FireWeaponTimestamp;
-            fireWeaponTimestamp = 0.0f;
-            // Alert
-            CountdownTimer alertTimer = bot.AlertTimer;
-            ref float alertduration = ref alertTimer.Duration;
-            alertduration = 600.0f;
+                CountdownTimer ignoreEnemiesTimer = bot.IgnoreEnemiesTimer;
+                ref float ignoreEnemiesduration = ref ignoreEnemiesTimer.Duration;
+                ignoreEnemiesduration = 0.0f;
+                ref float ignoreEnemiestimestamp = ref ignoreEnemiesTimer.Timestamp;
+                ignoreEnemiestimestamp = 0.0f;
+                ref float ignoreEnemiestimescale = ref ignoreEnemiesTimer.Timescale;
+                ignoreEnemiestimescale = 1.0f;
 
-            ref float alerttimestamp = ref alertTimer.Timestamp;
-            alerttimestamp = now + alertduration;
+                CountdownTimer alertTimer = bot.AlertTimer;
+                ref float alerttimestamp = ref alertTimer.Timestamp;
+                if (alerttimestamp < now)
+                {
+                    ref float alertduration = ref alertTimer.Duration;
+                    alertduration = 8.0f;
+                    alerttimestamp = now + 8.0f;
+                    ref float alerttimescale = ref alertTimer.Timescale;
+                    alerttimescale = 1.0f;
+                }
+            }
+            else
+            {
+                ref bool isRapidFiring = ref bot.IsRapidFiring;
+                isRapidFiring = true;
 
-            ref float alerttimescale = ref alertTimer.Timescale;
-            alerttimescale = 1.0f;
-            // Never ignore enemies
-            CountdownTimer ignoreEnemiesTimer = bot.IgnoreEnemiesTimer;
+                ref float peripheralTimestamp = ref bot.PeripheralTimestamp;
+                peripheralTimestamp = 0.0f;
 
-            ref float ignoreEnemiesduration = ref ignoreEnemiesTimer.Duration;
-            ignoreEnemiesduration = 0.0f;
+                ref float fireWeaponTimestamp = ref bot.FireWeaponTimestamp;
+                fireWeaponTimestamp = 0.0f;
+                // Alert
+                CountdownTimer alertTimer = bot.AlertTimer;
+                ref float alertduration = ref alertTimer.Duration;
+                alertduration = 600.0f;
 
-            ref float ignoreEnemiestimestamp = ref ignoreEnemiesTimer.Timestamp;
-            ignoreEnemiestimestamp = 0.0f;
+                ref float alerttimestamp = ref alertTimer.Timestamp;
+                alerttimestamp = now + alertduration;
 
-            ref float ignoreEnemiestimescale = ref ignoreEnemiesTimer.Timescale;
-            ignoreEnemiestimescale = 1.0f;
+                ref float alerttimescale = ref alertTimer.Timescale;
+                alerttimescale = 1.0f;
+                // Never ignore enemies
+                CountdownTimer ignoreEnemiesTimer = bot.IgnoreEnemiesTimer;
 
-            // Never lookat (panic)
-            CountdownTimer panicTimer = bot.PanicTimer;
+                ref float ignoreEnemiesduration = ref ignoreEnemiesTimer.Duration;
+                ignoreEnemiesduration = 0.0f;
 
-            ref float panicduration = ref panicTimer.Duration;
-            panicduration = 0.0f;
+                ref float ignoreEnemiestimestamp = ref ignoreEnemiesTimer.Timestamp;
+                ignoreEnemiestimestamp = 0.0f;
 
-            ref float panictimestamp = ref panicTimer.Timestamp;
-            panictimestamp = 0.0f;
+                ref float ignoreEnemiestimescale = ref ignoreEnemiesTimer.Timescale;
+                ignoreEnemiestimescale = 1.0f;
 
-            ref float panictimescale = ref panicTimer.Timescale;
-            panictimescale = 1.0f;
-            // Never be surprised
-            CountdownTimer surpriseTimer = bot.SurpriseTimer;
+                // Never lookat (panic)
+                CountdownTimer panicTimer = bot.PanicTimer;
 
-            ref float surpriseDuration = ref surpriseTimer.Duration;
-            surpriseDuration = 0.0f;
+                ref float panicduration = ref panicTimer.Duration;
+                panicduration = 0.0f;
 
-            ref float surpriseTimestamp = ref surpriseTimer.Timestamp;
-            surpriseTimestamp = 0.0f;
+                ref float panictimestamp = ref panicTimer.Timestamp;
+                panictimestamp = 0.0f;
 
-            ref float surpriseTimescale = ref surpriseTimer.Timescale;
-            surpriseTimescale = 1.0f;
+                ref float panictimescale = ref panicTimer.Timescale;
+                panictimescale = 1.0f;
+                // Never be surprised
+                CountdownTimer surpriseTimer = bot.SurpriseTimer;
+
+                ref float surpriseDuration = ref surpriseTimer.Duration;
+                surpriseDuration = 0.0f;
+
+                ref float surpriseTimestamp = ref surpriseTimer.Timestamp;
+                surpriseTimestamp = 0.0f;
+
+                ref float surpriseTimescale = ref surpriseTimer.Timescale;
+                surpriseTimescale = 1.0f;
+            }
             // Always dodge
             ref bool isEnemySniperVisible = ref bot.IsEnemySniperVisible;
             isEnemySniperVisible = true;
@@ -679,6 +832,18 @@ public class BotState : BasePlugin
                     float prevDir = _lastLateralDir.GetValueOrDefault(idx);
                     _lastLateralDir[idx] = newDir;
                 }
+            }
+
+            // Flash flick: feet planted — skip jump/crouch/stuck movement overrides.
+            if (_flashPlantedUntil.TryGetValue(idx, out float flashPlantUntil) && now < flashPlantUntil)
+            {
+                _prevIsAttacking[idx] = curIsAttacking;
+                _prevInAir.TryGetValue(idx, out bool prevAirFlash);
+                bool nearLadderFlash = pawn.MoveType == MoveType_t.MOVETYPE_LADDER;
+                bool inAirFlash = !nearLadderFlash
+                    && (pawn.GroundEntity == null || !pawn.GroundEntity.IsValid);
+                _prevInAir[idx] = inAirFlash;
+                continue;
             }
 
             // Ladder Stuck Issue Fix
@@ -973,9 +1138,10 @@ public class BotState : BasePlugin
         // Flash projectiles never survive a round transition; drop their tracking
         // so entity indices reused next round don't match stale decisions.
         _flashThrownAt.Clear();
-        _flashRolledByBot.Clear();
         _flashDecisions.Clear();
         _flashRejectLogged.Clear();
+        _flashLookReleased.Clear();
+        _flashPlantedUntil.Clear();
         return HookResult.Continue;
     }
 
@@ -1161,8 +1327,9 @@ public class BotState : BasePlugin
         public static long StartUsercmdSuppression(
             object api, int slot, ulong buttonMask)
         {
-            return ((BotControllerApi.IBotControllerApi)api)
-                .StartUsercmdSuppression(slot, buttonMask);
+            var method = api.GetType().GetMethod("StartUsercmdSuppression");
+            if (method == null) return 0L;
+            return (long)(method.Invoke(api, [slot, buttonMask]) ?? 0L);
         }
 
         // Cancels one persistent usercmd suppression by its token
@@ -1170,8 +1337,9 @@ public class BotState : BasePlugin
         public static bool CancelUsercmdSuppression(
             object api, int slot, long suppressionId)
         {
-            return ((BotControllerApi.IBotControllerApi)api)
-                .CancelUsercmdSuppression(slot, suppressionId);
+            var method = api.GetType().GetMethod("CancelUsercmdSuppression");
+            if (method == null) return false;
+            return (bool)(method.Invoke(api, [slot, suppressionId]) ?? false);
         }
 
         // Applies the knife-slot weapon lock to one Bot
@@ -1608,7 +1776,7 @@ public class BotState : BasePlugin
         _botBlindFunction = null;
     }
 
-    // Stops native blind AI handling only when this flash was successfully avoided
+    // Scales native blind by facing angle at detonation (player-like), not a pre-roll.
     private HookResult OnBotBlindPre(DynamicHook hook)
     {
         try
@@ -1620,27 +1788,55 @@ public class BotState : BasePlugin
             if (player == null || player.HasBeenControlledByPlayerThisRound)
                 return HookResult.Continue;
 
+            var pawn = player.PlayerPawn?.Value;
+            if (pawn == null || !pawn.IsValid) return HookResult.Continue;
+
             int botIndex = (int)player.Index;
             if (!TryMatchFlashDecision(
                     botIndex,
                     Server.CurrentTime,
                     out (int bot, uint flash) matchedKey,
-                    out FlashDecision matched) ||
-                !matched.Avoided)
+                    out FlashDecision matched))
             {
                 return HookResult.Continue;
             }
 
-            if (_debugFlash)
+            float scale;
+            if (matched.IsPanic)
             {
-                float holdTime = hook.GetParam<float>(1);
-                float fadeTime = hook.GetParam<float>(2);
-                float alpha = hook.GetParam<float>(3);
-                BroadcastDebug(
-                    $"[Smarter-Bot/Flash] native blind blocked bot={player.PlayerName} flash#{matchedKey.flash} hold={holdTime:F2}s fade={fadeTime:F2}s alpha={alpha:F0}");
+                // Engine hold/fade/alpha already reflect partial turn — no second cut.
+                scale = 1f;
+            }
+            else
+            {
+                scale = ComputeFacingBlindScale(
+                    pawn, matched.FlashX, matched.FlashY, matched.FlashZ);
+            }
+            float holdTime = hook.GetParam<float>(1);
+            float fadeTime = hook.GetParam<float>(2);
+            float alpha = hook.GetParam<float>(3);
+
+            if (!matched.BlindApplied)
+            {
+                matched.BlindApplied = true;
+            }
+            matched.DebugHoldRaw = holdTime;
+            matched.DebugHoldScaled = holdTime * scale;
+            matched.DebugHoldSet = true;
+            _flashDecisions[matchedKey] = matched;
+
+            // Detailed BLIND line is emitted from OnPlayerBlind (includes effective time).
+            if (scale <= 0.05f)
+                return HookResult.Stop;
+
+            if (scale < 0.99f)
+            {
+                hook.SetParam(1, holdTime * scale);
+                hook.SetParam(2, fadeTime * scale);
+                hook.SetParam(3, alpha * Math.Clamp(scale + 0.1f, 0f, 1f));
             }
 
-            return HookResult.Stop;
+            return HookResult.Continue;
         }
         catch (Exception ex)
         {
@@ -1949,15 +2145,19 @@ public class BotState : BasePlugin
         return Schema.GetRef<bool>(activeWeapon.Handle, "CCSWeaponBase", "m_bInReload");
     }
     //---------------------------------------------------------------------------------------
-    // Pre-rolls flash avoidance when the bot first sees the projectile through FOV and LOS
-    // The native blind hook reads the result before OnPlayerBlind consumes it
+    // Player-like flash (realism over sweat):
+    //   perceive 200–260ms → fight normally → flick away 130–170ms before boom →
+    //   HOLD away 100–160ms after boom → look back 120–180ms → release.
+    //   Panic: short late flick; blind = engine only (scale 100%, no 2nd multiply). Ball-smoke hides 藏烟闪.
     private void ProcessFlashbangAvoidance()
     {
         if (_scratchEye == null) return;
 
         float now = Server.CurrentTime;
+        float dt = Server.TickInterval > 0f ? Server.TickInterval : 0.015625f;
+        bool humanlike = HumanlikeMode.Enabled;
 
-        var live = new List<(uint idx, Vector pos, float detonateAt)>();
+        var live = new Dictionary<uint, (Vector pos, float detonateAt)>();
         foreach (var ent in Utilities.FindAllEntitiesByDesignerName<CBaseEntity>("flashbang_projectile"))
         {
             if (!ent.IsValid) continue;
@@ -1965,49 +2165,59 @@ public class BotState : BasePlugin
             if (pos == null) continue;
 
             uint eidx = ent.Index;
-            bool isNew = !_flashThrownAt.ContainsKey(eidx);
-            if (isNew)
+            if (!_flashThrownAt.ContainsKey(eidx))
             {
                 _flashThrownAt[eidx] = now;
-                if (_debugFlash)
-                    BroadcastDebug($"[Smarter-Bot/Flash] new flash#{eidx} at ({pos.X:F0},{pos.Y:F0},{pos.Z:F0}) fuse={FlashFuseSeconds:F2}s");
+                FlashLog(eidx, null, "SPAWN", $"pos=({pos.X:F0},{pos.Y:F0},{pos.Z:F0}) fuse={FlashFuseSeconds:F2}s");
             }
-            live.Add((eidx, pos, _flashThrownAt[eidx] + FlashFuseSeconds));
+            live[eidx] = (pos, _flashThrownAt[eidx] + FlashFuseSeconds);
         }
 
-        // Drop tracking for flashes that no longer exist (detonated / round end). Decisions
-        // linger for 2 seconds past detonation so OnPlayerBlind can still match them.
         if (_flashThrownAt.Count > live.Count)
         {
-            var alive = new HashSet<uint>(live.Select(f => f.idx));
-            var stale = _flashThrownAt.Keys.Where(k => !alive.Contains(k)).ToList();
+            var stale = _flashThrownAt.Keys.Where(k => !live.ContainsKey(k)).ToList();
             foreach (var k in stale)
             {
-                if (_debugFlash)
+                foreach (var key in _flashDecisions.Keys.Where(p => p.flash == k).ToList())
                 {
-                    foreach (var key in _flashDecisions.Keys.Where(p => p.flash == k).ToList())
+                    var d = _flashDecisions[key];
+                    string botName = $"#{key.bot}";
+                    foreach (var p in Utilities.GetPlayers())
                     {
-                        var d = _flashDecisions[key];
-                        BroadcastDebug(
-                            $"[Smarter-Bot/Flash] flash#{k} ended; bot#{key.bot} visible {(d.LastSeen - d.FirstSeen) * 1000f:F0}ms");
+                        if (p != null && p.IsValid && (int)p.Index == key.bot)
+                        {
+                            botName = p.PlayerName;
+                            break;
+                        }
                     }
+                    FlashLog(k, botName, "END",
+                        $"mode={FlashModeLabel(d)} turned={(d.Turning ? "yes" : "no")}");
                 }
                 _flashThrownAt.Remove(k);
-                foreach (var s in _flashRolledByBot.Values) s.Remove(k);
                 _flashRejectLogged.RemoveWhere(p => p.flash == k);
             }
         }
 
-        // Expire stale decisions (2s past their detonation) so we don't leak across rounds.
         if (_flashDecisions.Count > 0)
         {
-            var expired = _flashDecisions.Where(kvp => now - kvp.Value.DetonateAt > 2f)
+            var expired = _flashDecisions.Where(kvp => now - kvp.Value.LookBackEnd > 2f)
                                           .Select(kvp => kvp.Key)
                                           .ToList();
-            foreach (var k in expired) _flashDecisions.Remove(k);
+            foreach (var k in expired)
+            {
+                _flashDecisions.Remove(k);
+                _flashLookReleased.Remove(k);
+            }
         }
 
-        if (live.Count == 0) return;
+        // Only rebuild smoke cache while flashes are in flight.
+        if (live.Count > 0)
+            RefreshActiveSmokeCenters();
+        else
+            _activeSmokeCenters.Clear();
+
+        // Refresh planted windows; cleared bots drop out below.
+        var plantedActive = new HashSet<int>();
 
         foreach (var bot in Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller"))
         {
@@ -2017,71 +2227,327 @@ public class BotState : BasePlugin
             var pawn = bot.PlayerPawn?.Value;
             if (pawn == null || !pawn.IsValid || pawn.LifeState != (byte)LifeState_t.LIFE_ALIVE) continue;
 
+            var ccsBot = pawn.Bot;
+            if (ccsBot == null) continue;
+
             int bidx = (int)bot.Index;
-            if (!_flashRolledByBot.TryGetValue(bidx, out var rolled))
-            {
-                rolled = new HashSet<uint>();
-                _flashRolledByBot[bidx] = rolled;
-            }
 
-            foreach (var (fidx, fpos, detonateAt) in live)
+            foreach (var (fidx, entry) in live)
             {
-                if (now > detonateAt) continue;
-
-                bool inFov = IsInFov(pawn, fpos, FlashFovHorizDeg, FlashFovVertDeg,
-                                     out float dYaw, out float dPit);
-                if (!inFov)
-                {
-                    if (_debugFlash && _flashRejectLogged.Add((bidx, fidx)))
-                        BroadcastDebug($"[Smarter-Bot/Flash] bot={bot.PlayerName} flash#{fidx} REJECT-FOV dYaw={dYaw:F1} dPit={dPit:F1}");
-                    continue;
-                }
-                if (!BotCanSee(pawn, fpos))
-                {
-                    if (_debugFlash && _flashRejectLogged.Add((bidx, fidx)))
-                        BroadcastDebug($"[Smarter-Bot/Flash] bot={bot.PlayerName} flash#{fidx} REJECT-LOS dYaw={dYaw:F1} dPit={dPit:F1}");
-                    continue;
-                }
-                _flashRejectLogged.Remove((bidx, fidx));
+                var fpos = entry.pos;
+                float detonateAt = entry.detonateAt;
+                if (now > detonateAt + 0.5f) continue;
 
                 var key = (bidx, fidx);
-
-                if (rolled.Contains(fidx))
+                bool inFov = IsInFov(pawn, fpos, FlashFovHorizDeg, FlashFovVertDeg,
+                                     out _, out _);
+                bool canSee = false;
+                string rejectKind = inFov ? "LOS" : "FOV";
+                string smokeReason = "";
+                if (inFov)
                 {
-                    // Already rolled — refresh lastSeen so visible duration reflects full sight window
-                    if (_flashDecisions.TryGetValue(key, out var d))
+                    if (!BotCanSee(pawn, fpos))
+                        rejectKind = "LOS";
+                    else if (IsFlashOccludedBySmoke(pawn, fpos, out smokeReason))
+                        rejectKind = "SMOKE";
+                    else
+                        canSee = true;
+                }
+
+                if (!_flashDecisions.TryGetValue(key, out var decision))
+                {
+                    if (!canSee)
                     {
-                        d.LastSeen = now;
-                        _flashDecisions[key] = d;
+                        if (_flashRejectLogged.Add((bidx, fidx)))
+                        {
+                            string extra = rejectKind == "SMOKE"
+                                ? $" reason={smokeReason} smokes={_activeSmokeCenters.Count}"
+                                : "";
+                            FlashLog(fidx, bot.PlayerName, "REJECT",
+                                $"kind={rejectKind.ToLowerInvariant()}{extra}");
+                        }
+                        continue;
+                    }
+
+                    float perceive = humanlike
+                        ? FlashPerceiveDelayMin + (float)_random.NextDouble() * (FlashPerceiveDelayMax - FlashPerceiveDelayMin)
+                        : 0.12f + (float)_random.NextDouble() * 0.06f;
+                    float turnLead = humanlike
+                        ? FlashTurnLeadMin + (float)_random.NextDouble() * (FlashTurnLeadMax - FlashTurnLeadMin)
+                        : 0.12f + (float)_random.NextDouble() * 0.04f;
+                    float panicLead = humanlike
+                        ? FlashPanicLeadMin + (float)_random.NextDouble() * (FlashPanicLeadMax - FlashPanicLeadMin)
+                        : FlashPanicMinWindow;
+                    float holdAfter = humanlike
+                        ? FlashHoldAfterBoomMin + (float)_random.NextDouble() * (FlashHoldAfterBoomMax - FlashHoldAfterBoomMin)
+                        : 0.05f;
+                    float lookBack = humanlike
+                        ? FlashLookBackMin + (float)_random.NextDouble() * (FlashLookBackMax - FlashLookBackMin)
+                        : 0.10f;
+                    float yawSpeed = FlashTurnYawDegPerSecMin
+                        + (float)_random.NextDouble() * (FlashTurnYawDegPerSecMax - FlashTurnYawDegPerSecMin);
+
+                    float perceiveEnd = now + perceive;
+                    float turnStartAt = detonateAt - turnLead;
+                    bool canAvoid = perceiveEnd <= turnStartAt;
+                    bool isPanic = false;
+
+                    // Late panic: notice completes with a short window left → still flick (partial facing).
+                    if (!canAvoid)
+                    {
+                        float remainingAfterNotice = detonateAt - perceiveEnd;
+                        if (remainingAfterNotice >= FlashPanicMinWindow)
+                        {
+                            isPanic = true;
+                            turnStartAt = Math.Max(perceiveEnd, detonateAt - panicLead);
+                            if (turnStartAt >= detonateAt)
+                                turnStartAt = detonateAt - FlashPanicMinWindow;
+                        }
+                    }
+
+                    float remainingAtSight = detonateAt - now;
+                    decision = new FlashDecision
+                    {
+                        FirstSeen = now,
+                        LastSeen = now,
+                        DetonateAt = detonateAt,
+                        TurnStartAt = turnStartAt,
+                        LookBackStart = detonateAt + holdAfter,
+                        LookBackEnd = detonateAt + holdAfter + lookBack,
+                        PerceiveDelay = perceive,
+                        TurnLead = canAvoid ? turnLead : panicLead,
+                        YawSpeed = yawSpeed,
+                        CanAvoid = canAvoid,
+                        IsPanic = isPanic,
+                        BlindApplied = false,
+                        Turning = false,
+                        SavedCrouching = false,
+                        HasSavedPose = false,
+                        ReturnYaw = pawn.EyeAngles.Y,
+                        ReturnPitch = pawn.EyeAngles.X,
+                        FlashX = fpos.X,
+                        FlashY = fpos.Y,
+                        FlashZ = fpos.Z,
+                        RemainingAtSight = remainingAtSight,
+                    };
+                    _flashDecisions[key] = decision;
+                    {
+                        string mode = canAvoid ? "full" : (isPanic ? "panic" : "none");
+                        FlashLog(fidx, bot.PlayerName, "SEE",
+                            $"mode={mode} left={remainingAtSight * 1000f:F0}ms need={((perceive + turnLead) * 1000f):F0}ms " +
+                            $"perceive={perceive * 1000f:F0}ms turnAt=t-{(detonateAt - turnStartAt) * 1000f:F0}ms " +
+                            $"holdAfter={holdAfter * 1000f:F0}ms lookBack={lookBack * 1000f:F0}ms");
                     }
                     continue;
                 }
-                rolled.Add(fidx);
 
-                float msLeft = (detonateAt - now) * 1000f;
-                double prob = msLeft <= 150f ? 0.05
-                            : msLeft <= 250f ? 0.20
-                            : msLeft <= 400f ? 0.50
-                            : msLeft <= 600f ? 0.90
-                            : 0.95;
+                float holdSpan = Math.Clamp(decision.LookBackStart - decision.DetonateAt, FlashHoldAfterBoomMin, FlashHoldAfterBoomMax);
+                float backSpan = Math.Clamp(decision.LookBackEnd - decision.LookBackStart, FlashLookBackMin, FlashLookBackMax);
+                decision.DetonateAt = detonateAt;
+                decision.LookBackStart = detonateAt + holdSpan;
+                decision.LookBackEnd = decision.LookBackStart + backSpan;
 
-                bool avoided = _random.NextDouble() <= prob;
-
-                _flashDecisions[key] = new FlashDecision
+                if (decision.IsPanic)
                 {
-                    FirstSeen = now,
-                    LastSeen = now,
-                    DetonateAt = detonateAt,
-                    Avoided = avoided,
-                };
-
-                if (_debugFlash)
+                    decision.TurnStartAt = decision.FirstSeen + decision.PerceiveDelay;
+                    float latest = detonateAt - FlashPanicMinWindow;
+                    if (decision.TurnStartAt > latest)
+                        decision.TurnStartAt = Math.Max(decision.FirstSeen, latest);
+                }
+                else
                 {
-                    BroadcastDebug(
-                        $"[Smarter-Bot/Flash] bot={bot.PlayerName} sees flash#{fidx} t-{msLeft:F0}ms prob={prob * 100:F0}% roll={(avoided ? "AVOID" : "flash")}");
+                    float lead = Math.Clamp(decision.TurnLead, FlashTurnLeadMin, FlashTurnLeadMax);
+                    decision.TurnStartAt = detonateAt - lead;
+                }
+
+                if (canSee)
+                {
+                    decision.LastSeen = now;
+                    decision.FlashX = fpos.X;
+                    decision.FlashY = fpos.Y;
+                    decision.FlashZ = fpos.Z;
+                    _flashRejectLogged.Remove((bidx, fidx));
+                }
+
+                _flashDecisions[key] = decision;
+            }
+
+            foreach (var kvp in _flashDecisions.Where(k => k.Key.bot == bidx).ToList())
+            {
+                var key = kvp.Key;
+                var decision = kvp.Value;
+
+                if (!decision.CanAvoid && !decision.IsPanic)
+                    continue;
+
+                bool inAway = now >= decision.TurnStartAt && now < decision.LookBackStart;
+                bool inBack = now >= decision.LookBackStart && now <= decision.LookBackEnd;
+
+                if (inAway || inBack)
+                {
+                    if (!decision.Turning)
+                    {
+                        decision.Turning = true;
+                        decision.SavedCrouching = ccsBot.IsCrouching;
+                        decision.HasSavedPose = true;
+                        decision.ReturnYaw = pawn.EyeAngles.Y;
+                        decision.ReturnPitch = pawn.EyeAngles.X;
+                        if (_debugFlash)
+                        {
+                            string kind = decision.IsPanic ? "panic" : "late";
+                            FlashLog(key.flash, bot.PlayerName, "TURN",
+                                $"kind={kind} at t-{(decision.DetonateAt - now) * 1000f:F0}ms planted");
+                        }
+                    }
+
+                    if (inAway)
+                    {
+                        ApplyFlashViewTurn(ccsBot, pawn, decision, dt, away: true);
+                    }
+                    else
+                    {
+                        ApplyFlashViewTurn(ccsBot, pawn, decision, dt, away: false);
+                    }
+
+                    PlantFlashFeet(ccsBot, pawn, decision);
+                    _flashPlantedUntil[bidx] = decision.LookBackEnd;
+                    plantedActive.Add(bidx);
+                    _flashDecisions[key] = decision;
+                }
+                else if (decision.Turning && now > decision.LookBackEnd
+                         && _flashLookReleased.Add(key))
+                {
+                    ref float inhibit = ref ccsBot.InhibitLookAroundTimestamp;
+                    inhibit = 0f;
+                    ref bool pathControl = ref ccsBot.EyeAnglesUnderPathFinderControl;
+                    pathControl = false;
+                    if (_debugFlash)
+                    {
+                        FlashLog(key.flash, bot.PlayerName, "LOOKBACK", "done / release");
+                    }
                 }
             }
         }
+
+        // Drop stale planted flags for bots no longer in a flash window.
+        foreach (var idx in _flashPlantedUntil.Keys.ToList())
+        {
+            if (!plantedActive.Contains(idx) && now >= _flashPlantedUntil[idx])
+                _flashPlantedUntil.Remove(idx);
+        }
+    }
+
+    // View flick only; preserve crouch; kill horizontal slide for the short window.
+    private void ApplyFlashViewTurn(
+        CCSBot bot, CCSPlayerPawn pawn, FlashDecision decision, float dt, bool away)
+    {
+        float targetYaw;
+        float targetPitch;
+
+        if (away)
+        {
+            var origin = pawn.AbsOrigin;
+            if (origin == null) return;
+            float eyeX = origin.X;
+            float eyeY = origin.Y;
+            float eyeZ = origin.Z + pawn.ViewOffset.Z;
+            float dx = decision.FlashX - eyeX;
+            float dy = decision.FlashY - eyeY;
+            float len = MathF.Sqrt(dx * dx + dy * dy);
+            if (len < 1f) len = 1f;
+            float awayX = eyeX - dx / len * 200f;
+            float awayY = eyeY - dy / len * 200f;
+            targetYaw = MathF.Atan2(awayY - eyeY, awayX - eyeX) * (180f / MathF.PI);
+            // Horizontal flick only — don't dive pitch into a "cover face" pose.
+            targetPitch = Math.Clamp(decision.ReturnPitch * 0.2f, -8f, 8f);
+        }
+        else
+        {
+            targetYaw = decision.ReturnYaw;
+            targetPitch = decision.ReturnPitch;
+        }
+
+        float curYaw = pawn.EyeAngles.Y;
+        float curPitch = pawn.EyeAngles.X;
+        float yawSpeed = decision.YawSpeed > 1f ? decision.YawSpeed : FlashTurnYawDegPerSecMin;
+        float newYaw = MoveAngleToward(curYaw, targetYaw, yawSpeed * dt);
+        float newPitch = MoveAngleToward(curPitch, targetPitch, FlashTurnPitchDegPerSec * dt);
+
+        ref float lookYaw = ref bot.LookYaw;
+        lookYaw = newYaw;
+        ref float lookPitch = ref bot.LookPitch;
+        lookPitch = newPitch;
+        ref float lookYawVel = ref bot.LookYawVel;
+        lookYawVel = 0f;
+        ref float lookPitchVel = ref bot.LookPitchVel;
+        lookPitchVel = 0f;
+
+        ref float lookDur = ref bot.LookAtSpotDuration;
+        lookDur = 0f;
+        ref float lookTs = ref bot.LookAtSpotTimestamp;
+        lookTs = 0f;
+
+        ref bool pathControl = ref bot.EyeAnglesUnderPathFinderControl;
+        pathControl = false;
+
+        pawn.Teleport(null, new QAngle(newPitch, newYaw, 0f), null);
+    }
+
+    private static void PlantFlashFeet(CCSBot bot, CCSPlayerPawn pawn, in FlashDecision decision)
+    {
+        if (decision.HasSavedPose)
+        {
+            ref bool crouch = ref bot.IsCrouching;
+            crouch = decision.SavedCrouching;
+        }
+
+        // Stop walk/strafe during the flick window — view only.
+        pawn.AbsVelocity.X = 0f;
+        pawn.AbsVelocity.Y = 0f;
+    }
+
+    // Blind intensity from facing angle at boom (0°=full, 180°=almost none).
+    private static float ComputeFacingBlindScale(
+        CCSPlayerPawn pawn, float flashX, float flashY, float flashZ)
+    {
+        var origin = pawn.AbsOrigin;
+        if (origin == null) return 1f;
+
+        float eyeX = origin.X;
+        float eyeY = origin.Y;
+        float eyeZ = origin.Z + pawn.ViewOffset.Z;
+
+        float dx = flashX - eyeX;
+        float dy = flashY - eyeY;
+        float dz = flashZ - eyeZ;
+        float len = MathF.Sqrt(dx * dx + dy * dy + dz * dz);
+        if (len < 1f) return 1f;
+        dx /= len; dy /= len; dz /= len;
+
+        float pitchRad = pawn.EyeAngles.X * (MathF.PI / 180f);
+        float yawRad = pawn.EyeAngles.Y * (MathF.PI / 180f);
+        float fx = MathF.Cos(pitchRad) * MathF.Cos(yawRad);
+        float fy = MathF.Cos(pitchRad) * MathF.Sin(yawRad);
+        float fz = -MathF.Sin(pitchRad);
+
+        float cosAng = Math.Clamp(fx * dx + fy * dy + fz * dz, -1f, 1f);
+        float ang = MathF.Acos(cosAng) * (180f / MathF.PI);
+
+        if (ang <= 35f) return 1f;
+        if (ang <= 70f) return LerpFloat(1.00f, 0.55f, (ang - 35f) / 35f);
+        if (ang <= 110f) return LerpFloat(0.55f, 0.22f, (ang - 70f) / 40f);
+        if (ang <= 150f) return LerpFloat(0.22f, 0.08f, (ang - 110f) / 40f);
+        return 0.05f;
+    }
+
+    private static float LerpFloat(float a, float b, float t)
+        => a + (b - a) * Math.Clamp(t, 0f, 1f);
+
+    private static float MoveAngleToward(float current, float target, float maxDelta)
+    {
+        float delta = (float)NormalizeAngleDeg(target - current);
+        if (MathF.Abs(delta) <= maxDelta) return target;
+        return current + MathF.Sign(delta) * maxDelta;
     }
 
     // Decoupled horizontal/vertical FOV check. Source 2 QAngle convention:
@@ -2143,6 +2609,153 @@ public class BotState : BasePlugin
         var opts = new TraceOptions { InteractsWith = Masks.SolidBrushOnly };
         var result = Trace.TraceEndShape(_scratchEye, target, pawn, opts);
         return result.Fraction >= 0.999f;
+    }
+
+    // Reads density_threshold from addons/BotVision/config.json (chord thickness).
+    private void LoadBotVisionSmokeConfig()
+    {
+        _smokeDensityThreshold = FlashSmokeDefaultDensityThreshold;
+        try
+        {
+            string[] candidates =
+            {
+                Path.GetFullPath(Path.Combine(ModuleDirectory, "..", "..", "..", "BotVision", "config.json")),
+                Path.GetFullPath(Path.Combine(ModuleDirectory, "..", "..", "..", "..", "BotVision", "config.json")),
+            };
+
+            foreach (string path in candidates)
+            {
+                if (!File.Exists(path)) continue;
+                using var doc = JsonDocument.Parse(File.ReadAllText(path));
+                if (doc.RootElement.TryGetProperty("smoke", out var smoke)
+                    && smoke.TryGetProperty("density_threshold", out var thr)
+                    && thr.TryGetSingle(out float value)
+                    && value >= 0f)
+                {
+                    _smokeDensityThreshold = value;
+                    Logger.LogInformation(
+                        "[Smarter-Bot] BotVision smoke density_threshold={0:F2} ({1})",
+                        _smokeDensityThreshold, path);
+                    return;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "[Smarter-Bot] failed reading BotVision config; using default density_threshold");
+        }
+    }
+
+    private void RefreshActiveSmokeCenters()
+    {
+        _activeSmokeCenters.Clear();
+        foreach (var ent in Utilities.FindAllEntitiesByDesignerName<CBaseEntity>("smokegrenade_projectile"))
+        {
+            if (!ent.IsValid) continue;
+            var pos = ent.AbsOrigin;
+            if (pos == null) continue;
+            if (!IsSmokeProjectileActive(ent)) continue;
+            _activeSmokeCenters.Add((pos.X, pos.Y, pos.Z));
+        }
+    }
+
+    private static bool IsSmokeProjectileActive(CBaseEntity ent)
+    {
+        try
+        {
+            if (Schema.GetRef<bool>(ent.Handle, "CSmokeGrenadeProjectile", "m_bDidSmokeEffect"))
+                return true;
+        }
+        catch { }
+
+        try
+        {
+            int tickBegin = Schema.GetRef<int>(ent.Handle, "CSmokeGrenadeProjectile", "m_nSmokeEffectTickBegin");
+            if (tickBegin > 0) return true;
+        }
+        catch { }
+
+        return false;
+    }
+
+    // Resolves smoke occlusion for flash *tracking* (not final blind):
+    // ball-smoke only. Native GetSmokeDensityInLine via CSS MemoryFunction returned
+    // garbage dens (~3e9) and falsely REJECT-SMOKE'd clear LOS — disabled for now.
+    // Threshold still read from BotVision config.json for chord thickness.
+    private bool IsFlashOccludedBySmoke(CCSPlayerPawn pawn, Vector flashPos, out string reason)
+    {
+        reason = "";
+        var origin = pawn.AbsOrigin;
+        if (origin == null) return false;
+        if (_activeSmokeCenters.Count == 0) return false;
+
+        float eyeX = origin.X;
+        float eyeY = origin.Y;
+        float eyeZ = origin.Z + pawn.ViewOffset.Z;
+
+        return IsOccludedBySmokeBalls(
+            eyeX, eyeY, eyeZ,
+            flashPos.X, flashPos.Y, flashPos.Z,
+            out reason);
+    }
+
+    // 藏烟闪: flash inside cloud, or LOS punches a thick chord through smoke.
+    private bool IsOccludedBySmokeBalls(
+        float x0, float y0, float z0,
+        float x1, float y1, float z1,
+        out string reason)
+    {
+        reason = "";
+        if (_activeSmokeCenters.Count == 0) return false;
+
+        float r = FlashSmokeBallRadius;
+        float r2 = r * r;
+        float blockChord = Math.Max(
+            FlashSmokeMinBlockChord,
+            2f * r * _smokeDensityThreshold);
+
+        float dx = x1 - x0;
+        float dy = y1 - y0;
+        float dz = z1 - z0;
+        float len2 = dx * dx + dy * dy + dz * dz;
+        if (len2 < 1f) len2 = 1f;
+        float len = MathF.Sqrt(len2);
+
+        for (int i = 0; i < _activeSmokeCenters.Count; i++)
+        {
+            var smoke = _activeSmokeCenters[i];
+            float fx = x1 - smoke.X;
+            float fy = y1 - smoke.Y;
+            float fz = z1 - smoke.Z;
+            if (fx * fx + fy * fy + fz * fz <= r2)
+            {
+                reason = "flash-in-cloud";
+                return true;
+            }
+
+            float ox = x0 - smoke.X;
+            float oy = y0 - smoke.Y;
+            float oz = z0 - smoke.Z;
+            float a = len2;
+            float b = 2f * (ox * dx + oy * dy + oz * dz);
+            float c = ox * ox + oy * oy + oz * oz - r2;
+            float disc = b * b - 4f * a * c;
+            if (disc <= 0f) continue;
+
+            float sqrtDisc = MathF.Sqrt(disc);
+            float t0 = (-b - sqrtDisc) / (2f * a);
+            float t1 = (-b + sqrtDisc) / (2f * a);
+            float enter = Math.Clamp(Math.Min(t0, t1), 0f, 1f);
+            float leave = Math.Clamp(Math.Max(t0, t1), 0f, 1f);
+            float chord = (leave - enter) * len;
+            if (chord >= blockChord)
+            {
+                reason = $"chord={chord:F0}";
+                return true;
+            }
+        }
+
+        return false;
     }
 
     //---------------------------------------------------------------------------------------

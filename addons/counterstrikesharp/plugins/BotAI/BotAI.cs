@@ -28,7 +28,7 @@ public static class BotOffsets
 public class BotAI : BasePlugin
 {
     public override string ModuleName => "Patches - Bot AI";
-    public override string ModuleVersion => "1.8.9";
+    public override string ModuleVersion => "1.9.1";
     public override string ModuleAuthor => "K4ryuu & Austin (updated by ed0ard & Misaka17032 & XBribo & AmagiReina)";
     public override string ModuleDescription =>
         "Improve and fix bots' behavior comprehensively";
@@ -36,11 +36,33 @@ public class BotAI : BasePlugin
     private readonly List<PatchInfo> _appliedPatches = [];
     private readonly bool _isLinux = RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
 
+    // Only the worst wallhack / no-turn-flash patches stay deferred in humanlike.
+    // Combat helpers (aim drift zero, bomb hear) stay applied so bots are not "vanilla weak".
+    private static readonly HashSet<string> HumanlikeSkippedPatches = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "IsNoticable_AlwaysTrue",
+        "InViewCone_RemoveOuterFOV",
+        "InViewCone_RemoveInnerFOV",
+        "OnAudibleEvent_GlobalHearRange",
+        "FlashbangAvoidance_Disable",
+    };
 
+    // Resolved but not written while humanlike; can be applied when switching to hard mode.
+    private readonly Dictionary<string, (nint Addr, List<byte> Bytes, string Expected)> _deferredHardPatches = new();
+
+    public FakeConVar<int> BotHumanlike = new(
+        "bot_humanlike",
+        "1=humanlike awareness/flash/aim drift (default), 0=hard wallhack-style patches",
+        1);
 
     public override void Load(bool hotReload)
     {
         Logger.LogInformation("Bot AI Patches loading...");
+        RegisterFakeConVars(this);
+
+        HumanlikeMode.Enabled = BotHumanlike.Value != 0;
+        BotHumanlike.ValueChanged += OnHumanlikeChanged;
+
         var patchDefinitions = _isLinux ? LinuxPatchDefinitions.All : WindowsPatchDefinitions.All;
 
         // "<name>_Cave" entries build a code cave that their "<name>" partner then
@@ -86,6 +108,8 @@ public class BotAI : BasePlugin
             else Logger.LogError($"{name}: FAILED.");
         }
 
+        bool humanlike = HumanlikeMode.Enabled;
+
         foreach (var name in patchDefinitions.Keys)
         {
             if (caveNames.Contains(name)) continue;
@@ -97,8 +121,21 @@ public class BotAI : BasePlugin
                 continue;
             }
 
-            bool ok = sites.TryGetValue(name, out nint addr)
-                && WritePatch(name, addr, patchBytes[name], patchDefinitions[name].expectedOriginal);
+            if (!sites.TryGetValue(name, out nint addr) || !patchBytes.TryGetValue(name, out var bytes))
+            {
+                Logger.LogError($"{name}: FAILED.");
+                continue;
+            }
+
+            // Defer wallhack / instant-lock / no-turn-flash patches in humanlike mode.
+            if (humanlike && HumanlikeSkippedPatches.Contains(name))
+            {
+                _deferredHardPatches[name] = (addr, bytes, patchDefinitions[name].expectedOriginal);
+                Logger.LogInformation($"{name}: deferred (bot_humanlike 1).");
+                continue;
+            }
+
+            bool ok = WritePatch(name, addr, bytes, patchDefinitions[name].expectedOriginal);
             if (ok) Logger.LogInformation($"{name}: applied.");
             else
             {
@@ -139,15 +176,77 @@ public class BotAI : BasePlugin
             return HookResult.Continue;
         });
 
-        Logger.LogInformation($"Applied {_appliedPatches.Count}/{patchDefinitions.Count} patches.");
+        Logger.LogInformation(
+            $"Applied {_appliedPatches.Count}/{patchDefinitions.Count} patches (humanlike={humanlike}, deferred={_deferredHardPatches.Count}).");
     }
 
     public override void Unload(bool hotReload)
     {
         Logger.LogInformation("Bot AI Patches unloading...");
+        BotHumanlike.ValueChanged -= OnHumanlikeChanged;
         foreach (var patch in _appliedPatches) RestorePatch(patch);
         _appliedPatches.Clear();
+        _deferredHardPatches.Clear();
         Logger.LogInformation("All patches restored.");
+    }
+
+    private void OnHumanlikeChanged(object? sender, int value)
+    {
+        bool wantHumanlike = value != 0;
+        HumanlikeMode.Enabled = wantHumanlike;
+
+        if (wantHumanlike)
+            DeferHardPatchesFromApplied();
+        else
+            ApplyDeferredHardPatches();
+
+        Logger.LogInformation($"bot_humanlike -> {value} (deferred hard patches={_deferredHardPatches.Count})");
+        Server.PrintToConsole($"[BotAI] bot_humanlike = {value}");
+    }
+
+    private void DeferHardPatchesFromApplied()
+    {
+        var toRemove = _appliedPatches
+            .Where(p => HumanlikeSkippedPatches.Contains(p.Name))
+            .ToList();
+
+        foreach (var patch in toRemove)
+        {
+            // Keep bytes so hard mode can re-apply without re-resolving signatures.
+            var hardBytes = new List<byte>(patch.OriginalBytes.Count);
+            for (int i = 0; i < patch.OriginalBytes.Count; i++)
+                hardBytes.Add(Marshal.ReadByte(patch.Address, i));
+
+            RestorePatch(patch);
+            _appliedPatches.Remove(patch);
+            _deferredHardPatches[patch.Name] = (patch.Address, hardBytes, string.Empty);
+            Logger.LogInformation($"{patch.Name}: restored (humanlike).");
+        }
+    }
+
+    private void ApplyDeferredHardPatches()
+    {
+        foreach (var (name, site) in _deferredHardPatches.ToList())
+        {
+            if (_appliedPatches.Any(p => p.Name == name)) continue;
+
+            // expectedOriginal empty means we already validated once; skip re-check.
+            if (string.IsNullOrEmpty(site.Expected))
+            {
+                if (!WritePatchUnchecked(name, site.Addr, site.Bytes))
+                    Logger.LogError($"{name}: re-apply FAILED.");
+                else
+                    Logger.LogInformation($"{name}: applied (hard mode).");
+            }
+            else if (WritePatch(name, site.Addr, site.Bytes, site.Expected))
+            {
+                Logger.LogInformation($"{name}: applied (hard mode).");
+            }
+            else
+            {
+                Logger.LogError($"{name}: apply FAILED.");
+            }
+        }
     }
 
     // ── Patch machinery ───────────────────────────────────────────────────────
@@ -164,7 +263,7 @@ public class BotAI : BasePlugin
             for (int i = 0; i < patchBytes.Count; i++)
                 origBytes.Add(Marshal.ReadByte(addr, i));
 
-            if (!ValidateOrig(name, origBytes, expectedOriginal))
+            if (!string.IsNullOrEmpty(expectedOriginal) && !ValidateOrig(name, origBytes, expectedOriginal))
             {
                 Logger.LogError($"'{name}': byte mismatch. Expected [{expectedOriginal}] " +
                                 $"got [{string.Join(" ", origBytes.Select(b => $"{b:X2}"))}].");
@@ -176,6 +275,25 @@ public class BotAI : BasePlugin
 
             _appliedPatches.Add(new PatchInfo(name, addr, origBytes));
             Logger.LogInformation($"'{name}' patched at 0x{addr:X} ({patchBytes.Count} bytes).");
+            return true;
+        }
+        catch (Exception ex) { Logger.LogError($"'{name}': {ex.Message}"); return false; }
+    }
+
+    private bool WritePatchUnchecked(string name, nint addr, List<byte> patchBytes)
+    {
+        try
+        {
+            if (patchBytes.Count == 0 || !IsValid(addr)) return false;
+
+            var origBytes = new List<byte>();
+            for (int i = 0; i < patchBytes.Count; i++)
+                origBytes.Add(Marshal.ReadByte(addr, i));
+
+            if (!MemoryPatch.SetMemAccess(addr, patchBytes.Count)) return false;
+            for (int i = 0; i < patchBytes.Count; i++) Marshal.WriteByte(addr, i, patchBytes[i]);
+
+            _appliedPatches.Add(new PatchInfo(name, addr, origBytes));
             return true;
         }
         catch (Exception ex) { Logger.LogError($"'{name}': {ex.Message}"); return false; }

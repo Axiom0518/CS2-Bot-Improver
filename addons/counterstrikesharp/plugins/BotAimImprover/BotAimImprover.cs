@@ -17,7 +17,7 @@ namespace BotAimImprover;
 public class BotAimImprover : BasePlugin
 {
     public override string ModuleName => "BotAimImprover";
-    public override string ModuleVersion => "2.1.3";
+    public override string ModuleVersion => "2.1.5";
     public override string ModuleAuthor => "ed0ard & htfy96 & XBribo";
     public override string ModuleDescription => "Restores intelligent aim part selection for CS2 bots.";
 
@@ -136,6 +136,10 @@ public class BotAimImprover : BasePlugin
     // Cleared on round_start and per-bot on disconnect.
     private readonly ConcurrentDictionary<IntPtr, int> _botToControllerUserId = new();
 
+    // Humanlike: delay aim-spot overrides after first acquiring an enemy.
+    private readonly ConcurrentDictionary<IntPtr, (int EnemyIdx, float AcquiredAt, float ReactDelay)> _enemyAcquire = new();
+    private readonly Random _reactRng = new();
+
     // Aim mode controlled by the `bot_aim` console command:
     //   Mixed = priority logic; snipers + spread weapons aim body-first, others head-first
     //   Head  = always head-first
@@ -184,6 +188,7 @@ public class BotAimImprover : BasePlugin
         RegisterEventHandler<EventRoundStart>((_, _) =>
         {
             _botToControllerUserId.Clear();
+            _enemyAcquire.Clear();
             return HookResult.Continue;
         });
 
@@ -254,7 +259,10 @@ public class BotAimImprover : BasePlugin
             // 1) Gate: enemy must be generally visible before we
             //    spend any raytraces. Otherwise the native used last-known position.
             if (ReadByte(pCCSBot + _off.IsVisible) == 0)
+            {
+                _enemyAcquire.TryRemove(pCCSBot, out _);
                 return HookResult.Continue;
+            }
 
             // 2) Resolve enemy pawn from m_enemy CHandle.
             int enemyHandleRaw = ReadInt32(pCCSBot + _off.Enemy);
@@ -264,6 +272,20 @@ public class BotAimImprover : BasePlugin
             int enemyIdx = enemyHandleRaw & 0x7FFF;
             if (enemyIdx <= 0 || enemyIdx >= 4096)
                 return HookResult.Continue;
+
+            // Humanlike: 40–110ms reaction before we override native aim point.
+            if (HumanlikeMode.Enabled)
+            {
+                float now = Server.CurrentTime;
+                if (!_enemyAcquire.TryGetValue(pCCSBot, out var acq) || acq.EnemyIdx != enemyIdx)
+                {
+                    float delay = 0.04f + (float)_reactRng.NextDouble() * 0.07f;
+                    _enemyAcquire[pCCSBot] = (enemyIdx, now, delay);
+                    return HookResult.Continue;
+                }
+                if (now - acq.AcquiredAt < acq.ReactDelay)
+                    return HookResult.Continue;
+            }
 
             CCSPlayerPawn? enemyPawn = Utilities.GetEntityFromIndex<CCSPlayerPawn>(enemyIdx);
             if (enemyPawn == null || !enemyPawn.IsValid || enemyPawn.Handle == IntPtr.Zero)
