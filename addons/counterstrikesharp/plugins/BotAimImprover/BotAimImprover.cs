@@ -6,8 +6,6 @@ using CounterStrikeSharp.API.Core.Attributes;
 using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Utils;
 using CounterStrikeSharp.API.Modules.Memory.DynamicFunctions;
-using CounterStrikeSharp.API.Core.Capabilities;
-using RayTraceAPI;
 using Microsoft.Extensions.Logging;
 
 
@@ -17,7 +15,7 @@ namespace BotAimImprover;
 public class BotAimImprover : BasePlugin
 {
     public override string ModuleName => "BotAimImprover";
-    public override string ModuleVersion => "2.1.5";
+    public override string ModuleVersion => "2.4.3";
     public override string ModuleAuthor => "ed0ard & htfy96 & XBribo";
     public override string ModuleDescription => "Restores intelligent aim part selection for CS2 bots.";
 
@@ -83,6 +81,17 @@ public class BotAimImprover : BasePlugin
         16               // FEET
     };
 
+    // Mixed 65% roll: chest first, then other upper-body, gut only if covered.
+    private static readonly int[] _priorityChest =
+    {
+        3, 6, 7,         // CHEST, L_CHEST, R_CHEST
+        8, 9,            // L_SHOULDER, R_SHOULDER
+        2, 1, 0,         // JAW, NECK, HEAD (still upper — not belly)
+        4, 5, 10, 11,    // GUT, PELVIS, L_GUT, R_GUT
+        12, 13, 14, 15,  // L_THIGH, R_THIGH, L_SHIN, R_SHIN
+        16               // FEET
+    };
+
     private static readonly int[] _priorityBody =
     {
         4, 5, 3,         // GUT, PELVIS, CHEST,
@@ -129,21 +138,21 @@ public class BotAimImprover : BasePlugin
     private Offsets _off;
 
     private MemoryFunctionVoid<IntPtr>? _pickNewAimSpot;
-    private static readonly PluginCapability<CRayTraceInterface> _rayTraceCapability =
-        new("raytrace:craytraceinterface");
 
     // Cache: CCSBot* -> bot's UserId .
     // Cleared on round_start and per-bot on disconnect.
     private readonly ConcurrentDictionary<IntPtr, int> _botToControllerUserId = new();
 
-    // Humanlike: delay aim-spot overrides after first acquiring an enemy.
-    private readonly ConcurrentDictionary<IntPtr, (int EnemyIdx, float AcquiredAt, float ReactDelay)> _enemyAcquire = new();
+    // Per-engage roll only. No OnTick re-trace — that + broken RayTraceAPI field
+    // caused MissingFieldException spam (FPS stutter) and unstable aim.
+    private readonly ConcurrentDictionary<IntPtr, (int EnemyKey, bool PreferHead)> _aimRoll = new();
     private readonly Random _reactRng = new();
 
-    // Aim mode controlled by the `bot_aim` console command:
-    //   Mixed = priority logic; snipers + spread weapons aim body-first, others head-first
-    //   Head  = always head-first
-    //   Body  = always body-first
+    // Aim mode (`bot_aim`):
+    //   Mixed = rifles 35% head-first / 65% chest-first per engage
+    //   Head  = always head-first (AWP body, as author)
+    //   Body  = always gut-first
+    // Write m_targetSpot in PickNewAimSpot Post only. Native interpolation = reaction.
     private enum AimMode { MIXED, HEAD, BODY }
     private AimMode _aimMode = AimMode.MIXED;
 
@@ -154,8 +163,13 @@ public class BotAimImprover : BasePlugin
         "weapon_nova", "weapon_xm1014", "weapon_sawedoff", "weapon_mag7", "weapon_revolver"
     };
 
-    // One-shot flag so we log a single confirmation that overrides are actually firing.
-    private bool _firstOverrideLogged = false;
+    // Light telemetry — enough to review a match without per-frame spam.
+    private bool _firstOverrideLogged;
+    private int _overrideCount;
+    private int _cntHeadBand;   // HEAD/NECK/JAW
+    private int _cntChestBand;  // CHEST/shoulders
+    private int _cntGutBand;    // GUT/PELVIS/limbs
+    private float _nextAimStatsAt;
 
     // ============================================================
     // Lifecycle
@@ -188,7 +202,21 @@ public class BotAimImprover : BasePlugin
         RegisterEventHandler<EventRoundStart>((_, _) =>
         {
             _botToControllerUserId.Clear();
-            _enemyAcquire.Clear();
+            _aimRoll.Clear();
+            _overrideCount = 0;
+            _cntHeadBand = 0;
+            _cntChestBand = 0;
+            _cntGutBand = 0;
+            return HookResult.Continue;
+        });
+
+        RegisterEventHandler<EventRoundEnd>((_, _) =>
+        {
+            LogAimStats("round_end");
+            _overrideCount = 0;
+            _cntHeadBand = 0;
+            _cntChestBand = 0;
+            _cntGutBand = 0;
             return HookResult.Continue;
         });
 
@@ -225,7 +253,7 @@ public class BotAimImprover : BasePlugin
                     break;
                 case "mixed":
                     _aimMode = AimMode.MIXED;
-                    reply = "[BotAimImprover] aim mode -> MIXED (default)";
+                    reply = "[BotAimImprover] aim mode -> MIXED (35% head-first / 65% chest-first per engage)";
                     break;
                 default:
                     reply = $"[BotAimImprover] Current aim mode: {_aimMode}. Valid values: head, body, mixed";
@@ -243,10 +271,6 @@ public class BotAimImprover : BasePlugin
 
     // ============================================================
     // Core override logic (Post-hook on PickNewAimSpot)
-    //
-    // Native function already set m_targetSpot to GUT or HEAD based on
-    // mp_damage_headshot_only. We re-pick based on visible enemy parts and the
-    // bot's weapon, then overwrite only the 12 bytes of m_targetSpot.
     // ============================================================
     private HookResult OnPickNewAimSpotPost(DynamicHook hook)
     {
@@ -256,67 +280,76 @@ public class BotAimImprover : BasePlugin
             if (pCCSBot == IntPtr.Zero)
                 return HookResult.Continue;
 
-            // 1) Gate: enemy must be generally visible before we
-            //    spend any raytraces. Otherwise the native used last-known position.
             if (ReadByte(pCCSBot + _off.IsVisible) == 0)
             {
-                _enemyAcquire.TryRemove(pCCSBot, out _);
+                _aimRoll.TryRemove(pCCSBot, out _);
                 return HookResult.Continue;
             }
 
-            // 2) Resolve enemy pawn from m_enemy CHandle.
             int enemyHandleRaw = ReadInt32(pCCSBot + _off.Enemy);
             if (enemyHandleRaw == -1)
                 return HookResult.Continue;
-
-            int enemyIdx = enemyHandleRaw & 0x7FFF;
-            if (enemyIdx <= 0 || enemyIdx >= 4096)
+            int enemyKey = enemyHandleRaw & 0x7FFF;
+            if (enemyKey <= 0 || enemyKey >= 4096)
                 return HookResult.Continue;
 
-            // Humanlike: 40–110ms reaction before we override native aim point.
-            if (HumanlikeMode.Enabled)
+            bool preferHead;
+            if (!_aimRoll.TryGetValue(pCCSBot, out var roll) || roll.EnemyKey != enemyKey)
             {
-                float now = Server.CurrentTime;
-                if (!_enemyAcquire.TryGetValue(pCCSBot, out var acq) || acq.EnemyIdx != enemyIdx)
+                preferHead = _aimMode switch
                 {
-                    float delay = 0.04f + (float)_reactRng.NextDouble() * 0.07f;
-                    _enemyAcquire[pCCSBot] = (enemyIdx, now, delay);
-                    return HookResult.Continue;
-                }
-                if (now - acq.AcquiredAt < acq.ReactDelay)
-                    return HookResult.Continue;
+                    AimMode.HEAD => true,
+                    AimMode.BODY => false,
+                    _ => _reactRng.NextDouble() < 0.35,
+                };
+                _aimRoll[pCCSBot] = (enemyKey, preferHead);
+            }
+            else
+            {
+                preferHead = roll.PreferHead;
             }
 
-            CCSPlayerPawn? enemyPawn = Utilities.GetEntityFromIndex<CCSPlayerPawn>(enemyIdx);
-            if (enemyPawn == null || !enemyPawn.IsValid || enemyPawn.Handle == IntPtr.Zero)
+            CCSPlayerPawn? enemyPawn = Utilities.GetEntityFromIndex<CCSPlayerPawn>(enemyKey);
+            if (enemyPawn == null || !enemyPawn.IsValid || enemyPawn.Handle == IntPtr.Zero
+                || enemyPawn.AbsOrigin == null)
                 return HookResult.Continue;
 
-            // 3) Resolve the bot's controller (for weapon + eye position).
             var botController = ResolveBotController(pCCSBot);
             if (botController == null || !TryGetBotEyePosition(botController, out var botEye))
                 return HookResult.Continue;
 
             string? wpn = botController.PlayerPawn?.Value?.WeaponServices?.ActiveWeapon?.Value?.DesignerName;
-
-            // 4) Select the priority order based on aim mode and weapon.
-            // head: awp -> others -> Head. body: all weapons -> Body.
-            // mixed: body-first weapons -> Body, others -> Jaw.
             bool isBodyWeapon = wpn != null && _bodyFirstWeapons.Contains(wpn);
             int[] order = _aimMode switch
             {
                 AimMode.HEAD => wpn == "weapon_awp" ? _priorityBody : _priorityHead,
                 AimMode.BODY => _priorityBody,
-                _ => isBodyWeapon ? _priorityBody : _priorityJaw, // MIXED
+                _ => isBodyWeapon
+                    ? _priorityChest
+                    : (preferHead ? _priorityHead : _priorityChest),
             };
 
-            // 5) Walk the priority order and raytrace each point from the bot's
-            // eye; the first visible point wins.
             int chosenIdx = -1;
             float rx = 0f, ry = 0f, rz = 0f;
+            // If every preferred part is occluded, still pick the first computable
+            // in-band point so native GUT does not win by default.
+            int fallbackIdx = -1;
+            float fbX = 0f, fbY = 0f, fbZ = 0f;
+            float oz = enemyPawn.AbsOrigin!.Z;
+            float eyeH = Math.Clamp(enemyPawn.ViewOffset?.Z ?? 64f, 40f, 72f);
             foreach (int idx in order)
             {
                 if (!TryComputePartPos(enemyPawn, idx, out float x, out float y, out float z))
                     continue;
+                // Clamp Z to a sane torso band — never write sky/floor outliers.
+                // (FEET absolute rise sits below oz+8 and is intentionally skipped.)
+                if (z < oz + 8f || z > oz + eyeH + 8f)
+                    continue;
+                if (fallbackIdx < 0)
+                {
+                    fallbackIdx = idx;
+                    fbX = x; fbY = y; fbZ = z;
+                }
                 if (!PointVisibleFromEye(botEye, x, y, z))
                     continue;
                 chosenIdx = idx;
@@ -324,23 +357,28 @@ public class BotAimImprover : BasePlugin
                 break;
             }
             if (chosenIdx < 0)
-                return HookResult.Continue;
+            {
+                if (fallbackIdx < 0)
+                    return HookResult.Continue;
+                chosenIdx = fallbackIdx;
+                rx = fbX; ry = fbY; rz = fbZ;
+            }
 
-            // 6) Overwrite only m_targetSpot.xyz.
             unsafe
             {
                 float* dst = (float*)(pCCSBot + _off.TargetSpot).ToPointer();
                 dst[0] = rx; dst[1] = ry; dst[2] = rz;
             }
 
-            // One-time confirmation that the override path actually runs end-to-end.
             if (!_firstOverrideLogged)
             {
                 _firstOverrideLogged = true;
                 Logger.LogInformation(
-                    "[BotAimImprover] Active: first override (weapon={W} point={P}).",
-                    wpn ?? "(null)", _aimPoints[chosenIdx].Name);
+                    "[BotAimImprover] Active: first override (weapon={W} point={P} mixedHead={H}).",
+                    wpn ?? "(null)", _aimPoints[chosenIdx].Name, preferHead);
             }
+
+            NoteAimPoint(chosenIdx);
         }
         catch (Exception ex)
         {
@@ -348,6 +386,34 @@ public class BotAimImprover : BasePlugin
         }
 
         return HookResult.Continue;
+    }
+
+    private void NoteAimPoint(int chosenIdx)
+    {
+        _overrideCount++;
+        string name = _aimPoints[chosenIdx].Name;
+        if (name is "HEAD" or "NECK" or "JAW")
+            _cntHeadBand++;
+        else if (name.Contains("CHEST") || name.Contains("SHOULDER"))
+            _cntChestBand++;
+        else
+            _cntGutBand++;
+
+        float now = Server.CurrentTime;
+        if (_overrideCount == 1 || _overrideCount % 40 == 0 || now >= _nextAimStatsAt)
+        {
+            _nextAimStatsAt = now + 30f;
+            LogAimStats("sample");
+        }
+    }
+
+    private void LogAimStats(string reason)
+    {
+        if (_overrideCount <= 0 && reason != "round_end")
+            return;
+        Logger.LogInformation(
+            "[BotAimImprover] stats({Reason}): n={N} headBand={H} chestBand={C} gutBand={G} mode={M}",
+            reason, _overrideCount, _cntHeadBand, _cntChestBand, _cntGutBand, _aimMode);
     }
 
     /// Find the CCSPlayerController whose pawn's m_pBot field equals pCCSBot.
@@ -393,7 +459,7 @@ public class BotAimImprover : BasePlugin
         var pawn = bot.PlayerPawn?.Value;
         var origin = pawn?.AbsOrigin;
         if (origin == null) return false;
-        float ez = pawn!.ViewOffset?.Z ?? 64.0f;
+        float ez = Math.Clamp(pawn!.ViewOffset?.Z ?? 64.0f, 40f, 72f);
         eye = new Vector(origin.X, origin.Y, origin.Z + ez);
         return true;
     }
@@ -409,7 +475,9 @@ public class BotAimImprover : BasePlugin
 
         ref readonly AimPoint p = ref _aimPoints[idx];
         float ox = origin.X, oy = origin.Y, oz = origin.Z;
-        float eyeZ = enemyPawn.ViewOffset?.Z ?? 64.0f;
+        // ViewOffset.Z must be relative eye height (~64). Clamp hard — a bad
+        // value here is exactly "gun tips at the sky".
+        float eyeZ = Math.Clamp(enemyPawn.ViewOffset?.Z ?? 64.0f, 40f, 72f);
 
         float yawDeg = enemyPawn.EyeAngles?.Y ?? 0.0f;
         double yawRad = yawDeg * Math.PI / 180.0;
@@ -430,19 +498,22 @@ public class BotAimImprover : BasePlugin
                  || float.IsInfinity(x) || float.IsInfinity(y) || float.IsInfinity(z));
     }
 
-    // World-only LoS test from eye to target point. True if unobstructed (>= 0.999).
-    private bool PointVisibleFromEye(Vector eye, float tx, float ty, float tz)
+    // Same LoS path BotState already uses in-game (CSS Trace + SolidBrushOnly).
+    // Do NOT use RayTraceAPI.InteractionLayers.MASK_WORLD_ONLY — runtime DLL
+    // mismatch throws MissingFieldException every call (FPS death).
+    private static bool PointVisibleFromEye(Vector eye, float tx, float ty, float tz)
     {
         try
         {
-            var rt = _rayTraceCapability.Get();
-            if (rt == null) return true; // RayTrace not loaded -> don't block
             var end = new Vector(tx, ty, tz);
-            var opts = new TraceOptions(InteractionLayers.MASK_WORLD_ONLY);
-            rt.TraceEndShape(eye, end, null, opts, out TraceResult res);
-            return res.Fraction >= 0.999f;
+            var opts = new TraceOptions { InteractsWith = Masks.SolidBrushOnly };
+            var result = Trace.TraceEndShape(eye, end, options: opts);
+            return result.Fraction >= 0.999f;
         }
-        catch { return true; }
+        catch
+        {
+            return true; // fail-open: still allow aim override
+        }
     }
 
     // ============================================================

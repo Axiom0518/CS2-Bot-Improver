@@ -17,10 +17,10 @@ using System.Text.Json;
 
 namespace BotState;
 
-public class BotState : BasePlugin
+public partial class BotState : BasePlugin
 {
     public override string ModuleName => "Smarter-Bot";
-    public override string ModuleVersion => "1.10.8";
+    public override string ModuleVersion => "1.14.4";
     public override string ModuleAuthor => "ed0ard & XBribo & unicbm";
     public override string ModuleDescription => "Make bots smarter";
 
@@ -71,6 +71,9 @@ public class BotState : BasePlugin
     private readonly Dictionary<int, float> _idleStartTime = new();
     private readonly Dictionary<int, float> _lastRepathTime = new();
     private readonly Dictionary<int, float> _reloadInterruptCooldown = new();
+    // Last non-trivial horizontal move dir (unit) — used to keep walking while Valve
+    // ClearMovement freezes bots during reload when no enemy is visible.
+    private readonly Dictionary<int, (float X, float Y)> _lastMoveDir = new();
     private readonly Dictionary<int, float> _fakeDefuseCooldown = new();
     private readonly Dictionary<nint, float> _fakeDefuseGuardUntil = new();
     private readonly Dictionary<nint, int> _fakeDefuseCounts = new();
@@ -247,6 +250,7 @@ public class BotState : BasePlugin
         RegisterEventHandler<EventDoorClose>(OnDoorClose);
         RegisterEventHandler<EventWeaponFire>(OnWeaponFire);
         RegisterEventHandler<EventPlayerDeath>(OnPlayerDeath);
+        RegisterEventHandler<EventPlayerSound>(OnPlayerSoundBelief);
         RegisterListener<Listeners.OnTick>(OnTick);
         // Prevent bots from holding their knives when there're enemies alive
         _gunReequipTimer = AddTimer(
@@ -255,9 +259,9 @@ public class BotState : BasePlugin
             CounterStrikeSharp.API.Modules.Timers.TimerFlags.REPEAT);
 
         Console.WriteLine(
-            $"[Smarter-Bot] flash v{ModuleVersion} ready (panic±45° + engine blind; thr={_smokeDensityThreshold:F2})");
+            $"[Smarter-Bot] v{ModuleVersion} ready (intel + decisions + flash)");
         Logger.LogInformation(
-            "[Smarter-Bot] flash v{Version} ready (panic±45 + engine blind)", ModuleVersion);
+            "[Smarter-Bot] v{Version} ready (intel + decisions + flash)", ModuleVersion);
     }
 
     // Resolves capabilities supplied by plugins after every plugin has loaded
@@ -289,9 +293,10 @@ public class BotState : BasePlugin
         Console.WriteLine($"[Smarter-Bot] flash debug = {_debugFlash}");
     }
 
-    // Server stdout + every connected human's console. Debug-gated only.
-    private static void BroadcastDebug(string msg)
+    // Plugin log + server stdout + every connected human's console.
+    private void BroadcastDebug(string msg)
     {
+        Logger.LogInformation("{Msg}", msg);
         Console.WriteLine(msg);
         foreach (var p in Utilities.GetPlayers())
         {
@@ -333,6 +338,9 @@ public class BotState : BasePlugin
                     ref float alerttimescale = ref alertTimer.Timescale;
                     alerttimescale = 1.0f;
                 }
+
+                // Directional hit cue — look along the shot, not at live attacker XYZ.
+                RecordDamageBelief(victim, attacker);
             }
         }
         catch { }
@@ -577,6 +585,7 @@ public class BotState : BasePlugin
             int idx = (int)player.Index;
             float now = Server.CurrentTime;
             InterruptReload(player, pawn, bot, now);
+            KeepWalkingWhileReload(player, pawn, bot, idx);
             // Door Stuck Fix
             bool inDoorCooldown = _doorEventCooldown.TryGetValue(idx, out float doorCooldownEnd) && now < doorCooldownEnd;
 
@@ -614,6 +623,12 @@ public class BotState : BasePlugin
                     ref float alerttimescale = ref alertTimer.Timescale;
                     alerttimescale = 1.0f;
                 }
+
+                // P3c: perceive → publish intel → decide (alert + sustain look).
+                TickBeliefPerception(player, pawn, bot, now);
+                TickBeliefDecisions(player, pawn, bot, idx, now);
+                // P3b: geometric clear only when intel/native are idle.
+                UpdateAngleClearing(player, pawn, bot, idx, now);
             }
             else
             {
@@ -717,7 +732,7 @@ public class BotState : BasePlugin
                         pawn.AbsVelocity.X += injX;
                         pawn.AbsVelocity.Y += injY;
 
-                        ResetLookAroundForBot(player);
+                        ResetLookAroundForBot(player, resetHidingSpots: true);
                     }
                 }
             }
@@ -990,7 +1005,7 @@ public class BotState : BasePlugin
                         ref float repathtimescale = ref repathTimer.Timescale;
                         repathtimescale = 1.0f;
 
-                        ResetLookAroundForBot(player);
+                        ResetLookAroundForBot(player, resetHidingSpots: true);
                     }
                 }
                 else
@@ -1050,6 +1065,7 @@ public class BotState : BasePlugin
         _idleStartTime.Clear();
         _lastRepathTime.Clear();
         _reloadInterruptCooldown.Clear();
+        _lastMoveDir.Clear();
         _fakeDefuseCooldown.Clear();
         _fakeDefuseGuardUntil.Clear();
         _fakeDefuseCounts.Clear();
@@ -1068,12 +1084,19 @@ public class BotState : BasePlugin
         _flashDecisions.Clear();
         _flashLookReleased.Clear();
         _flashPlantedUntil.Clear();
+        ClearAngleClearingState();
+        ClearBeliefState();
+        ClearDecisionState();
         return HookResult.Continue;
     }
 
     // Detects elimination while explicitly excluding the current death victim
     private HookResult OnPlayerDeath(EventPlayerDeath @event, GameEventInfo info)
     {
+        var victim = @event.Userid;
+        if (victim != null && victim.IsValid)
+            RecordTeammateDeathBelief(victim);
+
         // Deathmatch is free-for-all even though the engine still reports
         // temporary T/CT team numbers. Do not treat the last bot on one side
         // as a round elimination and lock the other bots to their knives.
@@ -1083,7 +1106,6 @@ public class BotState : BasePlugin
         if (_botController == null)
             return HookResult.Continue;
 
-        var victim = @event.Userid;
         if (victim == null || !victim.IsValid)
             return HookResult.Continue;
 
@@ -1291,6 +1313,13 @@ public class BotState : BasePlugin
             return ((BotControllerApi.IBotControllerApi)api)
                 .Unlock(slot, BotControllerApi.LockKind.Weapon);
         }
+
+        // True while NadeSystem (or any controller) is replaying motion on this slot.
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public static bool IsReplaying(object api, int slot)
+        {
+            return ((BotControllerApi.IBotControllerApi)api).IsReplaying(slot);
+        }
     }
 
     private HookResult OnDoorOpen(EventDoorOpen @event, GameEventInfo info)
@@ -1316,7 +1345,12 @@ public class BotState : BasePlugin
     private HookResult OnWeaponFire(EventWeaponFire @event, GameEventInfo info)
     {
         var shooter = @event.Userid;
-        if (shooter == null || !shooter.IsValid || !shooter.IsBot) return HookResult.Continue;
+        if (shooter == null || !shooter.IsValid) return HookResult.Continue;
+
+        // Gunshots: do NOT invent a hear radius here. Valve emits player_sound with
+        // the real audible Radius; OnPlayerSoundBelief handles that (same as players).
+
+        if (!shooter.IsBot) return HookResult.Continue;
 
         int idx = (int)shooter.Index;
         var pawn = shooter.PlayerPawn?.Value;
@@ -1454,7 +1488,7 @@ public class BotState : BasePlugin
 
     private HookResult OnBombBeginDefuse(EventBombBegindefuse @event, GameEventInfo info)
     {
-        ResetLookAroundForBot(@event.Userid);
+        ResetLookAroundForBot(@event.Userid, resetHidingSpots: true);
 
         var player = @event.Userid;
         // The bomb-defuser is revealed
@@ -1554,7 +1588,7 @@ public class BotState : BasePlugin
         ref float stateTimestamp = ref bot.StateTimestamp;
         stateTimestamp = Server.CurrentTime - 2.0f;
 
-        ResetLookAroundForBot(player);
+        ResetLookAroundForBot(player, resetHidingSpots: true);
 
         // Enable 360 FOV for this bot during search phase
         _fakeDefuseSearchingBots.Add(slot);
@@ -1814,8 +1848,11 @@ public class BotState : BasePlugin
         return HookResult.Continue;
     }
 
-    // Resets the Bot's look-around bookkeeping so it can reacquire threats
-    private static void ResetLookAroundForBot(CCSPlayerController? player)
+    // Resets the Bot's look-around bookkeeping so it can reacquire threats.
+    // resetHidingSpots: only after flash / forced re-search — a real player who
+    // just got flashed re-clears corners; routine combat shouldn't wipe progress.
+    private static void ResetLookAroundForBot(
+        CCSPlayerController? player, bool resetHidingSpots = false)
     {
         if (player == null || !player.IsValid || !player.IsBot) return;
         var pawn = player.PlayerPawn?.Value;
@@ -1826,13 +1863,18 @@ public class BotState : BasePlugin
         ref float inhibitLookAroundTimestamp = ref bot.InhibitLookAroundTimestamp;
         inhibitLookAroundTimestamp = 0f;
 
-        ref int checkedHidingSpotCount = ref bot.CheckedHidingSpotCount;
-        checkedHidingSpotCount = 0;
+        if (resetHidingSpots)
+        {
+            ref int checkedHidingSpotCount = ref bot.CheckedHidingSpotCount;
+            checkedHidingSpotCount = 0;
+        }
 
         ref float lookAroundStateTimestamp = ref bot.LookAroundStateTimestamp;
         lookAroundStateTimestamp = 0f;
     }
     //---------------------------------------------------------------------------------------
+    // Author posture: aggressive early-round (SafeTime=0, skip enemy-spawn revisit).
+    // Kept under humanlike — searching is layered on top, not instead of this.
     private static void ApplyBotState(CCSPlayerController player)
     {
         var pawn = player.PlayerPawn.Value;
@@ -1871,6 +1913,40 @@ public class BotState : BasePlugin
         _reloadInterruptCooldown[slot] = now + ReloadInterruptCooldown;
         Server.NextFrame(() => SwitchBackAfterReloadInterrupt(
             slot, weaponDefIndex));
+    }
+
+    // Valve CCSBot::Upkeep: if (IsReloading() && !enemyVisible) ClearMovement().
+    // Author never removed that. We only re-apply forward motion along the last
+    // travel direction so bots don't plant feet mid-route while topping off.
+    private void KeepWalkingWhileReload(
+        CCSPlayerController player, CCSPlayerPawn pawn, CCSBot bot, int idx)
+    {
+        float vx = pawn.AbsVelocity.X;
+        float vy = pawn.AbsVelocity.Y;
+        float speed2 = vx * vx + vy * vy;
+        if (speed2 > 40f * 40f)
+        {
+            float inv = 1f / MathF.Sqrt(speed2);
+            _lastMoveDir[idx] = (vx * inv, vy * inv);
+        }
+
+        if (!IsReloading(player) || bot.IsEnemyVisible || pawn.IsDefusing)
+            return;
+
+        if (_flashPlantedUntil.TryGetValue(idx, out float flashUntil)
+            && Server.CurrentTime < flashUntil)
+            return;
+
+        if (!_lastMoveDir.TryGetValue(idx, out var dir))
+            return;
+
+        ref bool isRunning = ref bot.IsRunning;
+        isRunning = true;
+
+        // Mild cruise — enough to leave the plant, not a sprint exploit.
+        const float reloadWalkSpeed = 130f;
+        pawn.AbsVelocity.X = dir.X * reloadWalkSpeed;
+        pawn.AbsVelocity.Y = dir.Y * reloadWalkSpeed;
     }
 
     // Selects a loaded primary first, then a loaded secondary weapon
@@ -2266,6 +2342,11 @@ public class BotState : BasePlugin
                     inhibit = 0f;
                     ref bool pathControl = ref ccsBot.EyeAnglesUnderPathFinderControl;
                     pathControl = false;
+                    // After flash: re-clear corners like a real player recovering vision.
+                    ref int checkedHiding = ref ccsBot.CheckedHidingSpotCount;
+                    checkedHiding = 0;
+                    ref float lookAroundTs = ref ccsBot.LookAroundStateTimestamp;
+                    lookAroundTs = 0f;
                 }
             }
         }
@@ -2340,7 +2421,10 @@ public class BotState : BasePlugin
         ref bool pathControl = ref bot.EyeAnglesUnderPathFinderControl;
         pathControl = false;
 
-        pawn.Teleport(null, new QAngle(newPitch, newYaw, 0f), null);
+        // Yaw-only Teleport. Pitch on AbsRotation tilts the whole pawn model until
+        // a jump/land resets it — that was the lingering "leaning bot" after flashes.
+        // Vertical aim stays on LookPitch above.
+        pawn.Teleport(null, new QAngle(0f, newYaw, 0f), null);
     }
 
     // Pick ±45° so the flash ends up more to the side/behind relative to new facing.

@@ -28,7 +28,7 @@ public static class BotOffsets
 public class BotAI : BasePlugin
 {
     public override string ModuleName => "Patches - Bot AI";
-    public override string ModuleVersion => "1.9.1";
+    public override string ModuleVersion => "1.9.3";
     public override string ModuleAuthor => "K4ryuu & Austin (updated by ed0ard & Misaka17032 & XBribo & AmagiReina)";
     public override string ModuleDescription =>
         "Improve and fix bots' behavior comprehensively";
@@ -37,7 +37,8 @@ public class BotAI : BasePlugin
     private readonly bool _isLinux = RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
 
     // Only the worst wallhack / no-turn-flash patches stay deferred in humanlike.
-    // Combat helpers (aim drift zero, bomb hear) stay applied so bots are not "vanilla weak".
+    // Author combat/tactics patches (Idle never-safe, spawn visited, aim drift zero,
+    // bomb hear, approach watch) stay applied — do not strip them for "search".
     private static readonly HashSet<string> HumanlikeSkippedPatches = new(StringComparer.OrdinalIgnoreCase)
     {
         "IsNoticable_AlwaysTrue",
@@ -52,7 +53,7 @@ public class BotAI : BasePlugin
 
     public FakeConVar<int> BotHumanlike = new(
         "bot_humanlike",
-        "1=humanlike awareness/flash/aim drift (default), 0=hard wallhack-style patches",
+        "1=humanlike awareness/flash/aim drift/angle-clear (default), 0=hard wallhack-style patches",
         1);
 
     public override void Load(bool hotReload)
