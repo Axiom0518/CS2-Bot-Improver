@@ -19,6 +19,7 @@ public partial class BotState
         Seen = 0,
         Heard = 1,
         Damage = 2,
+        Gun = 3,
     }
 
     private struct BeliefSpot
@@ -33,12 +34,28 @@ public partial class BotState
     }
 
     private readonly Dictionary<int, BeliefSpot[]> _beliefs = new();
+    private readonly Dictionary<int, VisContactState> _visContact = new();
+
+    private struct VisContactState
+    {
+        public bool WasVisible;
+        public float VisibleSince;
+        public bool CombatTouch;
+        public float LastX, LastY, LastZ;
+        public bool HasLast;
+    }
 
     // Memory windows after a legal hear (engine already gated who can hear).
     // Duration comes from player_sound; these clamp human short-term retention.
-    private const float BeliefSeenTtl = 5.0f;
+    private const float BeliefSeenTtl = 3.0f;
+    // After a real contact (aimed/shot, or LOS held briefly) keep the disappear
+    // doorway until the angle is stale. Glimpse-only still uses BeliefSeenTtl.
+    private const float BeliefLostVisHoldSeconds = 10.0f;
+    private const float BeliefLostVisMinVisible = 0.40f;
+    private const float BeliefLostVisRadius = 120f;
     private const float BeliefHeardMemMin = 2.0f;
     private const float BeliefHeardMemMax = 5.0f;
+    private const float BeliefStepHoldSeconds = 4.0f;
     private const float BeliefDamageTtl = 2.5f;
     private const float BeliefSeenRadius = 48f;
     private const float BeliefDamageRadius = 240f;
@@ -60,21 +77,23 @@ public partial class BotState
     private void ClearBeliefState()
     {
         _beliefs.Clear();
+        _visContact.Clear();
         BotIntelHub.ClearAll();
     }
 
     private BeliefSpot[] GetBeliefSlots(int botIndex)
     {
-        if (!_beliefs.TryGetValue(botIndex, out var slots) || slots == null || slots.Length < 3)
+        if (!_beliefs.TryGetValue(botIndex, out var slots) || slots == null || slots.Length < 4)
         {
-            slots = new BeliefSpot[3];
+            slots = new BeliefSpot[4];
             _beliefs[botIndex] = slots;
         }
         return slots;
     }
 
     private void UpsertBelief(int botIndex, BeliefKind kind, float x, float y, float z,
-        float radius, float ttl, float confidence, float now, bool allowMerge = true)
+        float radius, float ttl, float confidence, float now,
+        bool allowMerge = true, bool force = false)
     {
         var slots = GetBeliefSlots(botIndex);
         int i = (int)kind;
@@ -83,7 +102,7 @@ public partial class BotState
         bool wasActive = spot.Active && spot.ExpiresAt > now;
         bool merged = false;
 
-        if (wasActive && allowMerge && kind == BeliefKind.Heard)
+        if (wasActive && allowMerge && (kind == BeliefKind.Heard || kind == BeliefKind.Gun))
         {
             float mdx = x - spot.X;
             float mdy = y - spot.Y;
@@ -104,7 +123,7 @@ public partial class BotState
 
         if (!merged)
         {
-            if (wasActive && kind != BeliefKind.Damage
+            if (!force && wasActive && kind != BeliefKind.Damage
                 && spot.Confidence > confidence + 0.20f
                 && spot.ExpiresAt - now > ttl * 0.45f)
                 return;
@@ -171,6 +190,7 @@ public partial class BotState
             float kindBias = spot.Kind switch
             {
                 BeliefKind.Damage => 1.30f,
+                BeliefKind.Gun => 1.22f,
                 BeliefKind.Heard => 1.15f,
                 _ => 1.00f,
             };
@@ -185,6 +205,21 @@ public partial class BotState
 
         if (!found) return false;
         effectiveRadius = BeliefEffectiveRadius(best, now);
+        return true;
+    }
+
+    private bool TryGetBelief(
+        int botIndex, BeliefKind kind, float now, out BeliefSpot spot)
+    {
+        spot = default;
+        ExpireBeliefs(botIndex, now);
+        if (!_beliefs.TryGetValue(botIndex, out var slots) || slots == null)
+            return false;
+        int i = (int)kind;
+        if ((uint)i >= (uint)slots.Length) return false;
+        ref var s = ref slots[i];
+        if (!s.Active || now >= s.ExpiresAt) return false;
+        spot = s;
         return true;
     }
 
@@ -238,24 +273,98 @@ public partial class BotState
 
     private void UpdateVisibleBelief(CCSPlayerController botPlayer, CCSPlayerPawn pawn, CCSBot bot, float now)
     {
-        if (!bot.IsEnemyVisible) return;
+        int botIndex = (int)botPlayer.Index;
+        _visContact.TryGetValue(botIndex, out var contact);
 
-        CCSPlayerPawn? enemyPawn = null;
+        bool visible = bot.IsEnemyVisible;
+        bool haveEnemy = TryReadVisibleEnemyOrigin(bot, out float ex, out float ey, out float ez);
+
+        if (visible)
+        {
+            if (!contact.WasVisible)
+            {
+                contact.VisibleSince = now;
+                contact.CombatTouch = false;
+            }
+            if (bot.IsAttacking || bot.IsAimingAtEnemy)
+                contact.CombatTouch = true;
+
+            if (haveEnemy)
+            {
+                contact.LastX = ex;
+                contact.LastY = ey;
+                contact.LastZ = ez;
+                contact.HasLast = true;
+                UpsertBelief(botIndex, BeliefKind.Seen,
+                    ex, ey, ez,
+                    BeliefSeenRadius, BeliefSeenTtl, 0.95f, now, allowMerge: true);
+            }
+
+            contact.WasVisible = true;
+            _visContact[botIndex] = contact;
+            return;
+        }
+
+        if (contact.WasVisible)
+        {
+            if (haveEnemy)
+            {
+                contact.LastX = ex;
+                contact.LastY = ey;
+                contact.LastZ = ez;
+                contact.HasLast = true;
+            }
+            else if (!contact.HasLast)
+            {
+                var slots = GetBeliefSlots(botIndex);
+                ref var seen = ref slots[(int)BeliefKind.Seen];
+                if (seen.Active && seen.ExpiresAt > now)
+                {
+                    contact.LastX = seen.X;
+                    contact.LastY = seen.Y;
+                    contact.LastZ = seen.Z;
+                    contact.HasLast = true;
+                }
+            }
+            if (contact.HasLast)
+            {
+                float visFor = now - contact.VisibleSince;
+                bool realContact = contact.CombatTouch || visFor >= BeliefLostVisMinVisible;
+                float ttl = realContact ? BeliefLostVisHoldSeconds : BeliefSeenTtl;
+                float radius = realContact ? BeliefLostVisRadius : BeliefSeenRadius;
+                float conf = realContact ? 0.88f : 0.70f;
+                UpsertBelief(botIndex, BeliefKind.Seen,
+                    contact.LastX, contact.LastY, contact.LastZ,
+                    radius, ttl, conf, now, allowMerge: true, force: true);
+            }
+        }
+
+        contact.WasVisible = false;
+        contact.CombatTouch = false;
+        _visContact[botIndex] = contact;
+    }
+
+    private static bool TryReadVisibleEnemyOrigin(CCSBot bot, out float x, out float y, out float z)
+    {
+        x = y = z = 0f;
         try
         {
             var enemyHandle = bot.Enemy;
-            if (enemyHandle.IsValid)
-                enemyPawn = enemyHandle.Value;
+            if (!enemyHandle.IsValid)
+                return false;
+            var enemyPawn = enemyHandle.Value;
+            if (enemyPawn == null || !enemyPawn.IsValid || enemyPawn.AbsOrigin == null)
+                return false;
+            var pos = enemyPawn.AbsOrigin;
+            x = pos.X;
+            y = pos.Y;
+            z = pos.Z + 40f;
+            return true;
         }
-        catch { }
-
-        if (enemyPawn == null || !enemyPawn.IsValid || enemyPawn.AbsOrigin == null)
-            return; // never fall back to nearest-through-walls
-
-        var pos = enemyPawn.AbsOrigin!;
-        UpsertBelief((int)botPlayer.Index, BeliefKind.Seen,
-            pos.X, pos.Y, pos.Z + 40f,
-            BeliefSeenRadius, BeliefSeenTtl, 0.95f, now, allowMerge: true);
+        catch
+        {
+            return false;
+        }
     }
 
     private void UpdateNativeNoiseBelief(CCSPlayerController botPlayer, CCSBot bot, float now)
@@ -322,8 +431,11 @@ public partial class BotState
         int srcTeam = (int)source.TeamNum;
 
         // Short-term memory after the sound pulse (player keeps the contact in mind).
-        float memTtl = Math.Clamp(engineDuration * 2.2f + (isStep ? 1.2f : 1.8f),
-            BeliefHeardMemMin, BeliefHeardMemMax);
+        // Footsteps: keep the angle ~4s after the last pulse (silent walk does not refresh).
+        // Guns: shorter contact; still a live belief until ExpiresAt (no linger-vs-portal).
+        float memTtl = isStep
+            ? BeliefStepHoldSeconds
+            : Math.Clamp(engineDuration * 2.2f + 1.8f, BeliefHeardMemMin, BeliefHeardMemMax);
 
         foreach (var listener in Utilities.GetPlayers())
         {
@@ -358,25 +470,9 @@ public partial class BotState
             float hx = origin.X + jx;
             float hy = origin.Y + jy;
             float hz = origin.Z + 36f;
-            UpsertBelief((int)listener.Index, BeliefKind.Heard,
+            var kind = isStep ? BeliefKind.Heard : BeliefKind.Gun;
+            UpsertBelief((int)listener.Index, kind,
                 hx, hy, hz, fuzzy, memTtl, conf, now);
-
-            // Push into native InvestigateNoise on the sound event (not every tick).
-            var listenerBot = listenerPawn!.Bot;
-            if (listenerBot != null)
-            {
-                var heard = new BeliefSpot
-                {
-                    X = hx, Y = hy, Z = hz,
-                    Radius = fuzzy,
-                    Kind = BeliefKind.Heard,
-                    Active = true,
-                    Confidence = conf,
-                    CreatedAt = now,
-                    ExpiresAt = now + memTtl,
-                };
-                FeedNativeNoise(listenerBot, listenerPawn, in heard, now);
-            }
         }
 
         return HookResult.Continue;
@@ -402,6 +498,37 @@ public partial class BotState
         UpsertBelief((int)victim.Index, BeliefKind.Damage,
             lookX, lookY, lookZ,
             BeliefDamageRadius, BeliefDamageTtl, 0.92f, Server.CurrentTime, allowMerge: false);
+    }
+
+    // Teammate got shot — other bots look toward that fight (gun tier), not as Damage.
+    private void RecordAllyGunBelief(CCSPlayerController victim, CCSPlayerController attacker)
+    {
+        if (!HumanlikeMode.Enabled) return;
+        if (victim == null || !victim.IsValid) return;
+        var aOrigin = attacker.PlayerPawn?.Value?.AbsOrigin;
+        if (aOrigin == null) return;
+
+        float now = Server.CurrentTime;
+        int team = (int)victim.TeamNum;
+        float rangeSq = BeliefDeathCalloutRange * BeliefDeathCalloutRange;
+
+        foreach (var mate in Utilities.GetPlayers())
+        {
+            if (mate == null || !mate.IsValid || !mate.IsBot || !mate.PawnIsAlive) continue;
+            if ((int)mate.TeamNum != team) continue;
+            if (mate.Slot == victim.Slot) continue;
+
+            var lp = mate.PlayerPawn?.Value?.AbsOrigin;
+            if (lp == null) continue;
+            float dx = lp.X - aOrigin.X;
+            float dy = lp.Y - aOrigin.Y;
+            float dz = lp.Z - aOrigin.Z;
+            if (dx * dx + dy * dy + dz * dz > rangeSq) continue;
+
+            UpsertBelief((int)mate.Index, BeliefKind.Gun,
+                aOrigin.X, aOrigin.Y, aOrigin.Z + 40f,
+                220f, 2.5f, 0.80f, now);
+        }
     }
 
     private void RecordTeammateDeathBelief(CCSPlayerController victim)
@@ -480,6 +607,7 @@ public partial class BotState
                     case BeliefKind.Heard: heard++; break;
                     case BeliefKind.Seen: seen++; break;
                     case BeliefKind.Damage: dmg++; break;
+                    case BeliefKind.Gun: heard++; break;
                 }
             }
             if (any) bots++;

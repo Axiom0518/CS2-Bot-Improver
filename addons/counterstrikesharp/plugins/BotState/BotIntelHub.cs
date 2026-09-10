@@ -12,6 +12,7 @@ public static class BotIntelHub
     public const int KindSeen = 0;
     public const int KindHeard = 1;
     public const int KindDamage = 2;
+    public const int KindGun = 3;
 
     public struct Snapshot
     {
