@@ -6,9 +6,14 @@ using System.Collections.Generic;
 
 namespace BotState;
 
-// P3b/P5b — geometric clear is a LAST-RESORT fallback when the nav portal graph
-// is not ready. Once portals are built, UpdateAngleClearing becomes a no-op so
-// we stop the wall-sweep that P5a measured as ~35% of walk-time eye ownership.
+// P3b/P3c — light angle assist on top of author Vision_AlwaysWatchApproachPoints.
+//
+// Rules:
+// - Never replace author approach watching. If native LookAtSpot still has time, yield.
+// - Belief (heard/damage/last-seen) may suggest a LookAtSpot only when native is idle.
+// - Geometric corner rays are a weak fallback while moving — write LookAtSpot only,
+//   do not Teleport/LookYaw-fight the author's look pipeline (that felt like "smooth
+//   turns", not pre-aim).
 public partial class BotState
 {
     private const float ClearMinSpeed = 40f;
@@ -26,6 +31,7 @@ public partial class BotState
     private readonly Dictionary<int, AngleClearState> _angleClear = new();
     private readonly Vector _clearEye = new();
     private readonly Vector _clearEnd = new();
+    private int _clearTickCounter;
 
     private struct AngleClearState
     {
@@ -47,15 +53,8 @@ public partial class BotState
         int botIndex,
         float now)
     {
-        // P5b: portal pre-aim owns idle walking eyes when the graph is ready.
-        if (_navGraphReady)
-        {
-            if (_angleClear.ContainsKey(botIndex))
-                _angleClear.Remove(botIndex);
-            return;
-        }
-
-        if (((_navWorkFrame + botIndex) & 3) != 0)
+        _clearTickCounter++;
+        if ((_clearTickCounter + botIndex) % 4 != 0)
         {
             if (_angleClear.TryGetValue(botIndex, out var pending) && pending.HasTarget && now < pending.HoldUntil)
                 ApplyClearLook(bot, pawn, pending, now);
@@ -160,9 +159,6 @@ public partial class BotState
             && BotControllerBridge.IsReplaying(_botController, player.Slot))
             return true;
 
-        if (IsOurPortalLook(botIndex, bot, now))
-            return true;
-
         // Heard/seen intel owns the eyes when fresh; geometric clear is idle pre-aim.
         if (TryGetBestBelief(botIndex, now, out var threat, out _)
             && now - threat.CreatedAt < 1.5f
@@ -171,44 +167,26 @@ public partial class BotState
 
         // Author approach / native look owns the eyes — we only fill gaps.
         float remaining = bot.LookAtSpotTimestamp + bot.LookAtSpotDuration - now;
-        if (remaining > ClearNativeLookYield
-            && !IsOurClearLook(botIndex, bot, now)
-            && !IsOurPortalLook(botIndex, bot, now))
+        if (remaining > ClearNativeLookYield && !IsOurClearLook(botIndex, bot, now))
             return true;
 
         return false;
     }
 
-    private bool TryComputeClearLook(
-        CCSPlayerPawn pawn, out float lookX, out float lookY, out float lookZ)
+    private bool IsOurClearLook(int botIndex, CCSBot bot, float now)
     {
-        lookX = lookY = lookZ = 0f;
-        var origin = pawn.AbsOrigin;
-        if (origin == null) return false;
-
-        float vx = pawn.AbsVelocity.X;
-        float vy = pawn.AbsVelocity.Y;
-        float speed2 = vx * vx + vy * vy;
-        if (speed2 < ClearMinSpeed * ClearMinSpeed)
+        if (!_angleClear.TryGetValue(botIndex, out var state) || !state.HasTarget)
+            return false;
+        if (now >= state.HoldUntil)
             return false;
 
-        float speed = MathF.Sqrt(speed2);
-        float eyeZ = origin.Z + (pawn.ViewOffset?.Z ?? 64f);
-        _clearEye.X = origin.X;
-        _clearEye.Y = origin.Y;
-        _clearEye.Z = eyeZ;
-        float baseYaw = MathF.Atan2(vy / speed, vx / speed) * (180f / MathF.PI);
-
-        Span<float> hits = stackalloc float[ClearSweepOffsets.Length];
-        for (int i = 0; i < ClearSweepOffsets.Length; i++)
-            hits[i] = TraceClearDistance(baseYaw + ClearSweepOffsets[i]);
-
-        return TryPickClearCorner(origin.X, origin.Y, eyeZ, baseYaw, hits,
-            out lookX, out lookY, out lookZ);
+        var spot = bot.LookAtSpot;
+        if (spot == null) return false;
+        float dx = spot.X - state.TargetX;
+        float dy = spot.Y - state.TargetY;
+        float dz = spot.Z - state.TargetZ;
+        return dx * dx + dy * dy + dz * dz < 40f * 40f;
     }
-
-    private bool IsOurClearLook(int botIndex, CCSBot bot, float now)
-        => IsDirectedLook(botIndex, bot, now, LookOwner.Clear);
 
     private float TraceClearDistance(float yawDeg)
     {

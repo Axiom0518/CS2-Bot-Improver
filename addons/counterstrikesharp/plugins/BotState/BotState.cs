@@ -20,7 +20,7 @@ namespace BotState;
 public partial class BotState : BasePlugin
 {
     public override string ModuleName => "Smarter-Bot";
-    public override string ModuleVersion => "1.19.7";
+    public override string ModuleVersion => "1.14.4";
     public override string ModuleAuthor => "ed0ard & XBribo & unicbm";
     public override string ModuleDescription => "Make bots smarter";
 
@@ -252,7 +252,6 @@ public partial class BotState : BasePlugin
         RegisterEventHandler<EventPlayerDeath>(OnPlayerDeath);
         RegisterEventHandler<EventPlayerSound>(OnPlayerSoundBelief);
         RegisterListener<Listeners.OnTick>(OnTick);
-        RegisterListener<Listeners.OnMapStart>(OnNavMapStart);
         // Prevent bots from holding their knives when there're enemies alive
         _gunReequipTimer = AddTimer(
             1.0f,
@@ -260,9 +259,9 @@ public partial class BotState : BasePlugin
             CounterStrikeSharp.API.Modules.Timers.TimerFlags.REPEAT);
 
         Console.WriteLine(
-            $"[Smarter-Bot] v{ModuleVersion} ready (look: dmg>gun>step>seen>portal)");
+            $"[Smarter-Bot] v{ModuleVersion} ready (intel + decisions + flash)");
         Logger.LogInformation(
-            "[Smarter-Bot] v{Version} ready (look: dmg>gun>step>seen>portal)", ModuleVersion);
+            "[Smarter-Bot] v{Version} ready (intel + decisions + flash)", ModuleVersion);
     }
 
     // Resolves capabilities supplied by plugins after every plugin has loaded
@@ -272,27 +271,6 @@ public partial class BotState : BasePlugin
         try { _botController = BotControllerBridge.TryGet(); } catch { _botController = null; }
         if (_botController == null)
             Console.WriteLine("[Smarter-Bot] BotController API not available");
-
-        // NEVER build nav mesh synchronously here — GetAllNavAreas can AV if the
-        // mesh pointer is not ready at plugin-load time (seen as "game start fail").
-        // Defer until the map has settled; explicit navrebuild/lookdebug can force.
-        _navNextEnsureAt = 0f;
-        AddTimer(5.0f, () =>
-        {
-            try { EnsureNavGraph(force: false); }
-            catch (Exception ex)
-            {
-                Logger.LogWarning(ex, "[Smarter-Bot] deferred nav build failed");
-            }
-        });
-        AddTimer(15.0f, () =>
-        {
-            try { EnsureNavGraph(force: false); }
-            catch (Exception ex)
-            {
-                Logger.LogWarning(ex, "[Smarter-Bot] deferred nav build failed");
-            }
-        });
     }
 
     [ConsoleCommand("css_botstate_flashdebug", "Toggle Smarter-Bot flashbang debug log")]
@@ -334,38 +312,35 @@ public partial class BotState : BasePlugin
         try
         {
             var victim = @event.Userid;
-            if (victim == null || !victim.IsValid)
-                return HookResult.Continue;
+            if (victim == null || !victim.IsValid || !victim.IsBot) return HookResult.Continue;
 
+            // World damage has no attacker, and self damage is nobody hurting
+            // anyone else.
             var attacker = @event.Attacker;
             if (attacker == null || !attacker.IsValid || attacker.Slot == victim.Slot)
                 return HookResult.Continue;
 
-            if (victim.IsBot)
-                RevealThroughSmoke(attacker.Slot, HurtRevealSeconds);
+            RevealThroughSmoke(attacker.Slot, HurtRevealSeconds);
 
+            // Humanlike: brief alert bump on taking damage (instead of perpetual alert wipe).
             if (HumanlikeMode.Enabled)
             {
-                if (victim.IsBot)
+                var pawn = victim.PlayerPawn?.Value;
+                var bot = pawn?.Bot;
+                if (bot != null)
                 {
-                    var pawn = victim.PlayerPawn?.Value;
-                    var bot = pawn?.Bot;
-                    if (bot != null)
-                    {
-                        float now = Server.CurrentTime;
-                        CountdownTimer alertTimer = bot.AlertTimer;
-                        ref float alertduration = ref alertTimer.Duration;
-                        alertduration = 3.0f;
-                        ref float alerttimestamp = ref alertTimer.Timestamp;
-                        alerttimestamp = now + alertduration;
-                        ref float alerttimescale = ref alertTimer.Timescale;
-                        alerttimescale = 1.0f;
-                    }
-
-                    RecordDamageBelief(victim, attacker);
+                    float now = Server.CurrentTime;
+                    CountdownTimer alertTimer = bot.AlertTimer;
+                    ref float alertduration = ref alertTimer.Duration;
+                    alertduration = 3.0f;
+                    ref float alerttimestamp = ref alertTimer.Timestamp;
+                    alerttimestamp = now + alertduration;
+                    ref float alerttimescale = ref alertTimer.Timescale;
+                    alerttimescale = 1.0f;
                 }
 
-                RecordAllyGunBelief(victim, attacker);
+                // Directional hit cue — look along the shot, not at live attacker XYZ.
+                RecordDamageBelief(victim, attacker);
             }
         }
         catch { }
@@ -588,13 +563,8 @@ public partial class BotState : BasePlugin
     //---------------------------------------------------------------------------------------
     private void OnTick()
     {
-        float tickNow = Server.CurrentTime;
-        _navWorkFrame++;
         ProcessFlashbangAvoidance();
-        ExpireReveals(tickNow);
-        // Do not EnsureNavGraph from OnTick — FindSignature/GetAllNavAreas is heavy
-        // and unsafe if the mesh pointer is stale. Timers + commands own builds.
-        TickLookDebugHeartbeat(tickNow);
+        ExpireReveals(Server.CurrentTime);
 
         foreach (var player in Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller"))
         {
@@ -613,7 +583,7 @@ public partial class BotState : BasePlugin
             if (isTakenOver) continue;
 
             int idx = (int)player.Index;
-            float now = tickNow;
+            float now = Server.CurrentTime;
             InterruptReload(player, pawn, bot, now);
             KeepWalkingWhileReload(player, pawn, bot, idx);
             // Door Stuck Fix
@@ -654,29 +624,14 @@ public partial class BotState : BasePlugin
                     alerttimescale = 1.0f;
                 }
 
-                // Sample AFTER writers so ownership reflects this tick.
-                try
-                {
-                    // P3c: perceive → publish intel → decide (alert + sustain look).
-                    TickBeliefPerception(player, pawn, bot, now);
-                    TickBeliefDecisions(player, pawn, bot, idx, now);
-                    TickLookDirector(player, pawn, bot, idx, now);
-                }
-                catch (Exception ex)
-                {
-                    if (_debugLook)
-                    {
-                        _lookTickExceptions++;
-                        _lookLastError = TruncateLookHint("pre:" + ex.GetType().Name, 48);
-                    }
-                }
-                SampleLookOwnership(player, pawn, bot, idx, now);
+                // P3c: perceive → publish intel → decide (alert + sustain look).
+                TickBeliefPerception(player, pawn, bot, now);
+                TickBeliefDecisions(player, pawn, bot, idx, now);
+                // P3b: geometric clear only when intel/native are idle.
+                UpdateAngleClearing(player, pawn, bot, idx, now);
             }
             else
             {
-                // Still sample in hard mode so lookdebug works either way.
-                SampleLookOwnership(player, pawn, bot, idx, now);
-
                 ref bool isRapidFiring = ref bot.IsRapidFiring;
                 isRapidFiring = true;
 
@@ -781,10 +736,8 @@ public partial class BotState : BasePlugin
                     }
                 }
             }
-            // Avoid Confusion — only while the enemy is actually visible.
-            // After LOS loss, zeroing inhibit lets AlwaysWatch steal the
-            // 10s last-contact look the director just wrote.
-            if (curIsAttacking && bot.IsEnemyVisible)
+            // Avoid Confusion
+            if (curIsAttacking)
             {
                 ref bool eyeAnglesUnderPathFinderControl = ref bot.EyeAnglesUnderPathFinderControl;
                 eyeAnglesUnderPathFinderControl = false;
@@ -1132,11 +1085,8 @@ public partial class BotState : BasePlugin
         _flashLookReleased.Clear();
         _flashPlantedUntil.Clear();
         ClearAngleClearingState();
-        ClearPortalPreaimState();
-        ClearDirectedLookState();
         ClearBeliefState();
         ClearDecisionState();
-        ClearLookDebugState();
         return HookResult.Continue;
     }
 

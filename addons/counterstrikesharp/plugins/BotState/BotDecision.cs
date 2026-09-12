@@ -16,40 +16,15 @@ public partial class BotState
     private const float DecisionAlertSeconds = 3.0f;
     // Only re-feed native noise when the belief is still "fresh".
     private const float DecisionNoiseFeedMaxAge = 1.25f;
-    // Soften belief whips: never demand more than this yaw per LookAtSpot write.
-    private const float BeliefMaxYawStep = 52f;
-    private const float BeliefLargeYawHoldMul = 1.50f;
-    private const float BeliefLargeYawHoldFrom = 38f;
 
     private readonly Dictionary<int, float> _decisionNextLookAt = new();
     private readonly Dictionary<int, float> _decisionLastNoiseFeedAt = new();
-    // Last LookAtSpot we wrote for intel — P5a ownership sampling.
-    private readonly Dictionary<int, IntelLookState> _intelLook = new();
-    private int _intelStealCount;
-
-    private struct IntelLookState
-    {
-        public float TargetX, TargetY, TargetZ;
-        public float HoldUntil;
-        public BeliefKind Kind;
-        public bool Active;
-        // P5c: when look snapped to a doorway instead of blob center.
-        public bool ViaPortal;
-        public int FromAreaId;
-        public int ToAreaId;
-        public float NextReassertAt;
-    }
 
     private void ClearDecisionState()
     {
         _decisionNextLookAt.Clear();
         _decisionLastNoiseFeedAt.Clear();
-        _intelLook.Clear();
-        _intelStealCount = 0;
     }
-
-    private bool IsOurIntelLook(int botIndex, CCSBot bot, float now)
-        => IsDirectedLook(botIndex, bot, now, LookOwner.Belief);
 
     private void TickBeliefDecisions(
         CCSPlayerController player,
@@ -58,12 +33,48 @@ public partial class BotState
         int botIndex,
         float now)
     {
-        if (!TryGetBestBelief(botIndex, now, out _, out _))
+        if (!TryGetBestBelief(botIndex, now, out var threat, out float radius))
+        {
+            _decisionNextLookAt.Remove(botIndex);
+            _decisionLastNoiseFeedAt.Remove(botIndex);
+            return;
+        }
+
+        // Feed native InvestigateNoise at most ~3 Hz, and only for fresh hears/hits.
+        float age = now - threat.CreatedAt;
+        if ((threat.Kind == BeliefKind.Heard || threat.Kind == BeliefKind.Damage)
+            && age <= DecisionNoiseFeedMaxAge)
+        {
+            if (!_decisionLastNoiseFeedAt.TryGetValue(botIndex, out float last)
+                || now - last >= 0.33f)
+            {
+                FeedNativeNoise(bot, pawn, in threat, now);
+                _decisionLastNoiseFeedAt[botIndex] = now;
+            }
+        }
+
+        RaiseAlertFromIntel(bot, now);
+
+        if (ShouldYieldIntelLook(player, bot, botIndex, now))
             return;
 
-        // Alert only. Do NOT write LookAtSpot here and do NOT feed NoisePosition:
-        // native investigate-noise fights the look director and makes bots stop/spin.
-        RaiseAlertFromIntel(bot, now);
+        if (!_decisionNextLookAt.TryGetValue(botIndex, out float nextAt))
+            nextAt = now;
+        if (now < nextAt)
+            return;
+
+        ApplyIntelLook(bot, pawn, threat, radius, now);
+
+        float gap = DecisionLookIntervalMin
+            + (float)_random.NextDouble() * (DecisionLookIntervalMax - DecisionLookIntervalMin);
+        if (threat.Kind == BeliefKind.Damage)
+            gap *= 0.55f;
+        else if (threat.Kind == BeliefKind.Heard)
+            gap *= 0.85f;
+        else if (threat.Confidence < 0.45f)
+            gap *= 1.20f;
+
+        _decisionNextLookAt[botIndex] = now + gap;
     }
 
     private static void FeedNativeNoise(CCSBot bot, CCSPlayerPawn pawn, in BeliefSpot threat, float now)
@@ -91,10 +102,10 @@ public partial class BotState
             ref float ts = ref bot.NoiseTimestamp;
             ts = now;
 
-            // Do not clear InhibitLookAround here — P5d keeps native approach
-            // from stealing while belief/portal owns the eyes. NoisePosition still
-            // feeds investigate path; LookAtSpot is ours.
-            // (Previously inhibit=0 invited AlwaysWatchApproachPoints mid-hold.)
+            // Do not touch NoiseTravelDistance / pathfinder flags every pulse —
+            // that fought native look and tipped barrels skyward.
+            ref float inhibit = ref bot.InhibitLookAroundTimestamp;
+            inhibit = 0f;
         }
         catch
         {
@@ -149,9 +160,8 @@ public partial class BotState
         return false;
     }
 
-    private void ApplyIntelLook(
-        CCSBot bot, CCSPlayerPawn pawn, int botIndex,
-        in BeliefSpot threat, float radius, float now)
+    private static void ApplyIntelLook(
+        CCSBot bot, CCSPlayerPawn pawn, in BeliefSpot threat, float radius, float now)
     {
         var spot = bot.LookAtSpot;
         if (spot == null) return;
@@ -160,138 +170,28 @@ public partial class BotState
         float eyeZ = origin != null
             ? origin.Z + Math.Clamp(pawn.ViewOffset?.Z ?? 64f, 40f, 72f)
             : threat.Z;
+        float z = Math.Clamp(threat.Z, eyeZ - 48f, eyeZ + 24f);
 
-        float tx = threat.X;
-        float ty = threat.Y;
-        float tz = Math.Clamp(threat.Z, eyeZ - 48f, eyeZ + 24f);
-        bool viaPortal = false;
-        int fromId = -1, toId = -1;
-
-        // P5c: occupy the doorway toward the belief, not the fuzzy blob center.
-        if (origin != null
-            && TryPickBeliefPortal(origin.X, origin.Y, origin.Z, eyeZ,
-                threat.X, threat.Y,
-                out float px, out float py, out float pz,
-                out fromId, out toId))
-        {
-            tx = px;
-            ty = py;
-            tz = pz;
-            viaPortal = true;
-        }
-
-        float holdMul = 1f;
-        if (origin != null)
-            SoftenBeliefLookXy(pawn, origin.X, origin.Y, ref tx, ref ty, out holdMul);
-
-        float hold = DecisionLookHold * holdMul;
-        if (threat.Kind == BeliefKind.Damage)
-            hold *= 0.85f;
-
-        spot.X = tx;
-        spot.Y = ty;
-        spot.Z = tz;
+        spot.X = threat.X;
+        spot.Y = threat.Y;
+        spot.Z = z;
 
         ref float lookDur = ref bot.LookAtSpotDuration;
-        lookDur = hold;
+        lookDur = DecisionLookHold;
         ref float lookTs = ref bot.LookAtSpotTimestamp;
         lookTs = now;
 
         ref bool lookAttack = ref bot.LookAtSpotAttack;
         lookAttack = false;
         ref bool lookClear = ref bot.LookAtSpotClearIfClose;
-        lookClear = false;
-        // Slightly tighter when we locked a doorway; wider for raw blob.
+        lookClear = true;
         ref float lookTol = ref bot.LookAtSpotAngleTolerance;
-        lookTol = viaPortal
-            ? Math.Clamp(7f + radius * 0.008f, 7f, 12f)
-            : Math.Clamp(8f + radius * 0.015f, 8f, 16f);
+        lookTol = Math.Clamp(8f + radius * 0.015f, 8f, 16f);
 
         ref bool pathControl = ref bot.EyeAnglesUnderPathFinderControl;
         pathControl = false;
 
-        // P5d: hold native look-around off for the duration of this intel look.
-        InhibitNativeLookAround(bot, now + hold + 0.08f);
-
-        _intelLook[botIndex] = new IntelLookState
-        {
-            TargetX = tx,
-            TargetY = ty,
-            TargetZ = tz,
-            HoldUntil = now + hold,
-            Kind = threat.Kind,
-            Active = true,
-            ViaPortal = viaPortal,
-            FromAreaId = fromId,
-            ToAreaId = toId,
-            NextReassertAt = now + 0.16f,
-        };
-    }
-
-    private void ReassertIntelLook(CCSBot bot, int botIndex, in IntelLookState state, float now)
-    {
-        var spot = bot.LookAtSpot;
-        if (spot != null)
-        {
-            spot.X = state.TargetX;
-            spot.Y = state.TargetY;
-            spot.Z = state.TargetZ;
-        }
-
-        float rem = Math.Max(0.08f, state.HoldUntil - now);
-        ref float lookDur = ref bot.LookAtSpotDuration;
-        lookDur = rem;
-        ref float lookTs = ref bot.LookAtSpotTimestamp;
-        lookTs = now;
-
-        try
-        {
-            ref bool pathControl = ref bot.EyeAnglesUnderPathFinderControl;
-            pathControl = false;
-        }
-        catch { /* schema */ }
-
-        InhibitNativeLookAround(bot, state.HoldUntil + 0.08f);
-        _intelStealCount++;
-
-        var stored = state;
-        stored.NextReassertAt = now + 0.16f;
-        _intelLook[botIndex] = stored;
-    }
-
-    // Cap demanded yaw so LookAtSpot doesn't whip 100°+ in one write.
-    // Next decision pulse continues toward the portal — progressive turn.
-    private static void SoftenBeliefLookXy(
-        CCSPlayerPawn pawn,
-        float originX, float originY,
-        ref float tx, ref float ty,
-        out float holdMul,
-        float maxYawStep = BeliefMaxYawStep)
-    {
-        holdMul = 1f;
-        if (maxYawStep < 8f) maxYawStep = 8f;
-        float eyeYaw = pawn.EyeAngles.Y;
-        float dx = tx - originX;
-        float dy = ty - originY;
-        float dist2 = dx * dx + dy * dy;
-        if (dist2 < 40f * 40f)
-            return;
-
-        float wantYaw = MathF.Atan2(dy, dx) * (180f / MathF.PI);
-        float delta = (float)NormalizeAngleDeg(wantYaw - eyeYaw);
-        float abs = MathF.Abs(delta);
-        if (abs >= BeliefLargeYawHoldFrom)
-            holdMul = BeliefLargeYawHoldMul;
-        if (abs <= maxYawStep)
-            return;
-
-        float step = MathF.CopySign(maxYawStep, delta);
-        float softYaw = eyeYaw + step;
-        float rad = softYaw * (MathF.PI / 180f);
-        float         dist = MathF.Sqrt(dist2);
-        dist = Math.Min(dist, 520f);
-        tx = originX + MathF.Cos(rad) * dist;
-        ty = originY + MathF.Sin(rad) * dist;
-        holdMul = BeliefLargeYawHoldMul;
+        ref float inhibit = ref bot.InhibitLookAroundTimestamp;
+        inhibit = 0f;
     }
 }
