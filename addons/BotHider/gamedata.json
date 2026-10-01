@@ -11,23 +11,31 @@
   "CCSBotManager::MaintainBotQuota": {
     "signatures": {
       "library": "server",
-      "windows": "40 55 41 56 48 8D 6C 24 ? 48 81 EC ? ? ? ? 4C 8B F1 FF 15",
-      "linux": "55 31 F6 48 89 E5 41 57 41 56 49 89 FE 31 FF 41 55 41 54 53 48 83 EC 28"
+      "windows": "40 55 41 57 48 8D 6C 24 ? 48 81 EC ? ? ? ? 4C 8B F9 FF 15",
+      "linux": "55 31 F6 48 89 E5 41 57 49 89 FF"
     },
     "comment": "runs the bot quota pass"
+  },
+  "CBaseIssue::CountPotentialVoters": {
+    "signatures": {
+      "library": "server",
+      "windows": "48 89 5C 24 ? 48 89 74 24 ? 57 41 56 41 57 48 83 EC ? 48 8B 05 ? ? ? ? 45 33 F6",
+      "linux": "55 48 89 E5 41 57 41 56 49 89 FE 41 55 41 54 53 31 DB 48 83 EC ? 4C 8D 2D ? ? ? ? 49 8B 45 ? 44 8B 60 ? 45 85 E4 0F 8E ? ? ? ? C7 45 ? ? ? ? ? 31 FF E8 ? ? ? ? 49 8B 55 ? 44 8B 62 ? 48 85 C0 0F 84 ? ? ? ? 45 31 FF 44 39 E3 0F 85"
+    },
+    "comment": "counts eligible voters"
   },
   "CCSPlayerController::HandleCommand_JoinTeam": {
     "signatures": {
       "library": "server",
       "windows": "48 89 5C 24 ? 44 88 44 24 ? 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 ? 48 81 EC ? ? ? ? 48 8B 3D",
-      "linux": "55 48 89 E5 41 57 41 56 41 89 D6 41 55 41 54 41 89 F4 53 48 89 FB 48 81 EC"
+      "linux": "55 48 89 E5 41 57 41 56 41 55 41 54 41 89 F4 53 48 89 FB 48 81 EC ? ? ? ? 48 8D 05"
     },
     "comment": "handles player team join requests"
   },
   "MpHumanTeam_ApplyRestriction": {
     "signatures": {
       "library": "server",
-      "windows": "40 55 48 8D 6C 24 ? 48 81 EC ? ? ? ? BA",
+      "windows": "40 55 57 48 8D 6C 24 ? 48 81 EC ? ? ? ? 48 8B 05 ? ? ? ? 48 8D 0D",
       "linux": "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ? ? ? ? E8 ? ? ? ? 89 C3"
     },
     "comment": "applies the human team restriction"
@@ -35,22 +43,18 @@
   "CNetworkGameServer::PackEntities": {
     "signatures": {
       "library": "engine2",
-      "windows": "4C 89 4C 24 ? 44 89 44 24 ? 48 89 54 24 ? 48 89 4C 24 ? 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ? ? ? ? B8 ? ? ? ? E8 ? ? ? ? 48 2B E0 4D 63 F8",
-      "linux": "55 48 89 E5 41 57 41 89 D7 41 56 48 8D 85"
+      "windows": "4C 89 4C 24 ? 44 89 44 24 ? 48 89 54 24 ? 48 89 4C 24 ? 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ? ? ? ? B8 ? ? ? ? E8 ? ? ? ? 48 2B E0 4C 8B E9",
+      "linux": "55 48 89 E5 41 57 41 89 D7 41 56 49 89 CE 41 55 41 54"
     },
     "comment": "packs network entities for clients"
   },
-  "CCSGameRules::SameMapTeardown": {
+  "CCSGameRules::EndMatchState": {
     "signatures": {
       "library": "server",
-      "windows": "41 3B DD 0F 84 99 00 00 00 41 8B 80 88 03 00 00 49 8B C8 C1 E8 08 A8 01 74 44",
-      "linux": "4C 8D BD 90 EE FF FF 31 F6 C7 85 90 EE FF FF 00 00 00 00 4C 89 FF E8 ? ? ? ? 49 8B 06 48 8D BD C0 EE FF FF"
+      "windows": "48 8B C4 55 41 57 48 8D A8 ? ? ? ? 48 81 EC ? ? ? ? 80 3D",
+      "linux": "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ? ? ? ? 48 89 BD ? ? ? ? E8"
     },
-    "offsets": {
-      "windows": -43,
-      "linux": 22
-    },
-    "comment": "restores bot identity before same-map teardown"
+    "comment": "temporarily restores bot identity during end-match team resets"
   },
   "CServerSideClient::SetName": {
     "offsets": {
@@ -58,13 +62,6 @@
       "linux": 63
     },
     "comment": "updates the client display name"
-  },
-  "GameResourceServiceServer::m_pEntitySystem": {
-    "offsets": {
-      "windows": 88,
-      "linux": 88
-    },
-    "comment": "resolves the game entity system"
   },
   "CEntitySystem::m_EntityList": {
     "offsets": {
@@ -94,26 +91,12 @@
     },
     "comment": "resolves an entity class name"
   },
-  "CBaseEntity::m_iTeamNum": {
-    "offsets": {
-      "windows": 836,
-      "linux": 836
-    },
-    "comment": "reads the current controller team"
-  },
   "CNetworkGameServerBase::m_Clients": {
     "offsets": {
-      "windows": 584,
-      "linux": 584
+      "windows": 616,
+      "linux": 616
     },
     "comment": "CUtlVector<CServerSideClient*> base offset"
-  },
-  "CBasePlayerController::FakeClientFlags": {
-    "offsets": {
-      "windows": 904,
-      "linux": 904
-    },
-    "comment": "controller fakeclient flags"
   },
   "CServerSideClient::m_UserIDString": {
     "offsets": {

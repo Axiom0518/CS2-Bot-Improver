@@ -39,7 +39,7 @@ bot_add_ct "NiKo";bot_add_ct "TeSeS";bot_add_ct "m0NESY";bot_add_ct "karrigan";b
 
 bot_add_t "NiKo";bot_add_t "TeSeS";bot_add_t "m0NESY";bot_add_t "karrigan";bot_add_t "kyousuke";mp_teamlogo_2 fal;mp_teamname_2 Falcons
 
-2.Team Vitality
+2. Team Vitality
 
 bot_add_ct "apEX";bot_add_ct "ZywOo";bot_add_ct "ropz";bot_add_ct "mezii";bot_add_ct "flameZ";mp_teamlogo_1 vita;mp_teamname_1 Team Vitality
 
@@ -51,7 +51,7 @@ bot_add_ct "sh1ro";bot_add_ct "magixx";bot_add_ct "tN1R";bot_add_ct "zont1x";bot
 
 bot_add_t "sh1ro";bot_add_t "magixx";bot_add_t "tN1R";bot_add_t "zont1x";bot_add_t "donk";mp_teamlogo_2 spir;mp_teamname_2 Spirit
 
-4.FURIA Esports
+4. FURIA Esports
 
 bot_add_ct "yuurih";bot_add_ct "FalleN";bot_add_ct "KSCERATO";bot_add_ct "YEKINDAR";bot_add_ct "molodoy";mp_teamlogo_1 furi;mp_teamname_1 FURIA Esports
 
@@ -267,7 +267,7 @@ bot_add_ct "cadiaN";bot_add_ct "spooke";bot_add_ct "arrozdoce";bot_add_ct "adamb
 
 bot_add_t "cadiaN";bot_add_t "spooke";bot_add_t "arrozdoce";bot_add_t "adamb";bot_add_t "bodyy";mp_teamlogo_2 og;mp_teamname_2 OG
 
-40.Sharks
+40. Sharks
 
 bot_add_ct "gafolo";bot_add_ct "koala";bot_add_ct "maxxkor";bot_add_ct "rdnzao";bot_add_ct "doc";mp_teamlogo_1 shrk;mp_teamname_1 Sharks
 

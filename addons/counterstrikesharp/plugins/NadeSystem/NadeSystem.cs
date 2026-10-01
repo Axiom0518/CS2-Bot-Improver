@@ -359,16 +359,16 @@ public partial class NadeSystemPlugin : BasePlugin
         IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, int, int, CSmokeGrenadeProjectile>
         _smokeCreate = new(
             RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
-                ? @"55 4C 89 C1 48 89 E5 41 57 49 89 FF 41 56 45 89 CE 41 55"
-                : @"48 8B C4 48 89 58 ? 48 89 68 ? 48 89 70 ? 57 41 56 41 57 48 81 EC ? ? ? ? 48 8B B4 24 ? ? ? ? 4D 8B F8");
+                ? @"55 4C 89 C1 48 89 E5 41 57 49 89 FF 41 56 45 89 CE"
+                : @"48 8B C4 48 89 58 ? 48 89 68 ? 48 89 70 ? 57 41 56 41 57 48 81 EC ? ? ? ? 48 8B B4 24");
 
     // CHEGrenadeProjectile::Create(pos, ang, vel, vel, owner, itemDef)
     private static readonly MemoryFunctionWithReturn<
         IntPtr, IntPtr, IntPtr, IntPtr, IntPtr, int, CHEGrenadeProjectile>
         _heCreate = new(
             RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
-                ? "55 4C 89 C1 48 89 E5 41 57 49 89 FF 41 56 49 89 D6 48 89 F2 48 89 FE 41 55"
-                : "48 89 ? 24 ? 48 89 ? 24 ? 48 89 ? 24 ? 57 48 83 EC ? 48 8B ? 24 ? 49 8B F8 4C 8B C2 0F 29 ? 24 ? 48 8B D1 48 8B D9 48 8D 0D ? ? ? ? 4C 8B CD E8 ? ? ? ? F3 0F 10 0D ? ? ? ? 48 8B C8 48 8B F0 E8 ? ? ? ? 48 8B D7 48 8B CE");
+                ? "55 4C 89 C1 48 89 E5 41 57 49 89 FF 41 56 49 89 D6"
+                : "48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B AC 24 ? ? ? ? 49 8B F8");
 
     // CMolotovProjectile::Create(pos, ang, vel, vel, owner, itemDef)
     private static readonly MemoryFunctionWithReturn<
@@ -376,6 +376,6 @@ public partial class NadeSystemPlugin : BasePlugin
         _molotovCreate = new(
             RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
                 ? "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 41 56 41 55 41 54 49 89 FC 53 48 81 EC ? ? ? ? 4C 8D 35"
-                : "48 8B C4 48 89 58 10 4C 89 40 18 48 89 48 08");
+                : "48 8B C4 48 89 58 ? 48 89 70 ? 48 89 78 ? 4C 89 40 ? 55 41 54 41 55 41 56 41 57 48 8D 6C 24");
 
 }

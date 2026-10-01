@@ -224,6 +224,14 @@ negev     m249
 </details>
 
 <details>
+<summary><strong>Панель не работает корректно?</strong></summary>
+   
+1. Установите **WebView2 Runtime**, если у вас Windows 10.
+2. Попробуйте запустить от имени администратора.
+
+</details>
+
+<details>
 <summary><strong>Как нормально играть на surf-картах?</strong></summary>
 
 Выполните `sv_standable_normal 0.7` в игровой консоли.
@@ -243,10 +251,8 @@ negev     m249
 
 - [Metamod:Source](https://github.com/alliedmodders/metamod-source)
 - [CounterStrikeSharp](https://github.com/roflmuffin/CounterStrikeSharp)
-- [Ray-Trace](https://github.com/FUNPLAY-pro-CS2/Ray-Trace)
 - [CS2-Bullseye-Bot](https://github.com/ed0ard/CS2-Bullseye-Bot)
 - [CS2-Bot-NadeSystem](https://github.com/ed0ard/CS2-Bot-NadeSystem)
-- [CS2_ExecAfter_No_Admin](https://github.com/ed0ard/CS2_ExecAfter_No_Admin), форк проекта [kus](https://github.com/kus)
 - [CS2-Bot-Randomizer](https://github.com/ed0ard/CS2-Bot-Randomizer)
 - [CS2-Lib](https://github.com/ianlucas/cs2-lib) от [Lucas](https://github.com/ianlucas)
 - [CS2-Bot-Hider](https://github.com/XBribo/CS2-Bot-Hider) от [XBribo](https://github.com/XBribo)

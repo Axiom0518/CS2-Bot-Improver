@@ -222,6 +222,14 @@ Add `-disable_workshop_command_filtering` to your launch options.
 </details>
 
 <details>
+<summary><strong>Panel not working properly?</strong></summary>
+   
+1. Install **WebView2 Runtime** if you are on Windows 10.
+2. Try right-clicking and selecting `Run as administrator`.
+
+</details>
+
+<details>
 <summary><strong>How to surf normally?</strong></summary>
 
 Run `sv_standable_normal 0.7` in the game console.
@@ -241,10 +249,8 @@ Run `sv_standable_normal 0.7` in the game console.
 
 - [Metamod:Source](https://github.com/alliedmodders/metamod-source)
 - [CounterStrikeSharp](https://github.com/roflmuffin/CounterStrikeSharp)
-- [Ray-Trace](https://github.com/FUNPLAY-pro-CS2/Ray-Trace)
 - [CS2-Bullseye-Bot](https://github.com/ed0ard/CS2-Bullseye-Bot)
 - [CS2-Bot-NadeSystem](https://github.com/ed0ard/CS2-Bot-NadeSystem)
-- [CS2_ExecAfter_No_Admin](https://github.com/ed0ard/CS2_ExecAfter_No_Admin), forked from [kus](https://github.com/kus)
 - [CS2-Bot-Randomizer](https://github.com/ed0ard/CS2-Bot-Randomizer)
 - [CS2-Lib](https://github.com/ianlucas/cs2-lib) by [Lucas](https://github.com/ianlucas)
 - [CS2-Bot-Hider](https://github.com/XBribo/CS2-Bot-Hider) by [XBribo](https://github.com/XBribo)

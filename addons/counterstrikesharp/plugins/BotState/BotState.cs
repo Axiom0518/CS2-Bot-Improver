@@ -99,14 +99,14 @@ public partial class BotState : BasePlugin
     [
         new(
             "IsVisiblePos_IgnoreFOV",
-            "48 8D 05 ? ? ? ? 48 C7 45 98 1F 01 00 00 48 89 45 90 45 0F B6 E8 0F 10 45 90",
+            "48 8D 05 ? ? ? ? 48 C7 45 ? ? ? ? ? 48 89 45 ? 45 0F B6 E8",
             19,
             [0x45, 0x0F, 0xB6, 0xE8],       // movzx r13d, r8b
             [0x45, 0x33, 0xED, 0x90]),      // xor r13d, r13d; nop
 
         new(
             "IsVisiblePlayer_IgnoreFOV",
-            "48 8D 05 ? ? ? ? 48 C7 45 CF 4D 01 00 00 48 89 45 C7 41 0F B6 D8 0F 10 45 C7",
+            "48 8D 05 ? ? ? ? 48 C7 45 ? ? ? ? ? 48 89 45 ? 41 0F B6 D8",
             19,
             [0x41, 0x0F, 0xB6, 0xD8],       // movzx ebx, r8b
             [0x33, 0xDB, 0x90, 0x90]),      // xor ebx, ebx; nop; nop
@@ -116,17 +116,17 @@ public partial class BotState : BasePlugin
     [
         new(
             "IsVisiblePos_IgnoreFOV",
-            "80 BD ? ? ? ? 00 74 ? 48 8B 7B 18 48 8B B5 ? ? ? ? 48 8B 07 FF 90 A0 09 00 00 84 C0 74 ?",
+            "80 BD ? ? ? ? ? 74 ? 48 8B 7B ? 48 8B B5",
             7,
             [0x74],                         // je no-FOV path
             [0xEB]),                        // jmp no-FOV path
 
         new(
             "IsVisiblePlayer_IgnoreFOV",
-            "45 84 F6 74 ? 49 8B 54 24 18 48 89 DF 48 8B 0A 48 89 55 98 48 8B 89 A0 09 00 00 48 89 4D A0 FF 90 B8 02 00 00",
+            "45 84 F6 0F 85 ? ? ? ? 48 89 DF FF 90",
             3,
-            [0x74],                         // je no-FOV path
-            [0xEB]),                        // jmp no-FOV path
+            [0x0F, 0x85, 0xB6, 0x00, 0x00, 0x00], // jne into optional FOV path
+            [0x90, 0x90, 0x90, 0x90, 0x90, 0x90]), // bypass optional FOV path
     ];
 
     private const int LinuxPageRead = 0x1;

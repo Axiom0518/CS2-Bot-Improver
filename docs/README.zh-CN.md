@@ -237,6 +237,14 @@ negev     m249
 </details>
 
 <details>
+<summary><strong>Panel无法正常运行？</strong></summary>
+   
+1. 如果你是 Windows 10 系统，需要安装 **WebView2运行时** 才能正常运行。
+2. 尝试右键以管理员身份运行。
+
+</details>
+
+<details>
 <summary><strong>如何正常进行滑翔（Surf）？</strong></summary>
 
 在游戏控制台中运行 `sv_standable_normal 0.7`。
@@ -256,10 +264,8 @@ negev     m249
 
 - [Metamod:Source](https://github.com/alliedmodders/metamod-source)
 - [CounterStrikeSharp](https://github.com/roflmuffin/CounterStrikeSharp)
-- [Ray-Trace](https://github.com/FUNPLAY-pro-CS2/Ray-Trace)
 - [CS2-Bullseye-Bot](https://github.com/ed0ard/CS2-Bullseye-Bot)
 - [CS2-Bot-NadeSystem](https://github.com/ed0ard/CS2-Bot-NadeSystem)
-- [CS2_ExecAfter_No_Admin](https://github.com/ed0ard/CS2_ExecAfter_No_Admin)，fork 自 [kus](https://github.com/kus)
 - [CS2-Bot-Randomizer](https://github.com/ed0ard/CS2-Bot-Randomizer)
 - [CS2-Lib](https://github.com/ianlucas/cs2-lib)，作者 [Lucas](https://github.com/ianlucas)
 - [CS2-Bot-Hider](https://github.com/XBribo/CS2-Bot-Hider)，作者 [XBribo](https://github.com/XBribo)
