@@ -197,9 +197,8 @@ public partial class NadeSystemPlugin : BasePlugin
                     flash.DispatchSpawn();
                     flash.Teleport(origin, angles, velocity);
                     AnnounceGrenadeThrow(bot, gtype);
-                    // Flash Immunity — shortened under humanlike so team flashes still hurt.
-                    float immuneSeconds = HumanlikeMode.Enabled ? 0.45f : 2f;
-                    float immuneUntil = Server.CurrentTime + immuneSeconds;
+                    // Flash Immunity
+                    float immuneUntil = Server.CurrentTime + 2f;
                     foreach (var teammate in Utilities
                         .FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller"))
                     {

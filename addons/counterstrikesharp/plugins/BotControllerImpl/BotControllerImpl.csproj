@@ -18,7 +18,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../BotControllerApi/BotControllerApi.csproj">
+    <ProjectReference Include="../../shared/BotControllerApi/BotControllerApi.csproj">
       <Private>false</Private>
     </ProjectReference>
   </ItemGroup>

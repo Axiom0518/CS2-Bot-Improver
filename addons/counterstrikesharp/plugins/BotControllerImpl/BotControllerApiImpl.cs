@@ -20,10 +20,19 @@ namespace BotControllerApi
         public int RecordedTickCount(int slot) => BotController.RecordedTickCount(slot);
         public (ReplayTick[] ticks, SubtickMove[] subs) GetRecordedMotion(int slot)
             => BotController.GetRecordedMotion(slot);
+        // Returns aligned tick, subtick, and command-frame buffers
+        public (ReplayTick[] ticks, SubtickMove[] subs, ReplayCommandFrame[] commands)
+            GetRecordedMotionExtended(int slot)
+            => BotController.GetRecordedMotionExtended(slot);
 
         // ---- replay ----
-        public bool LoadReplay(int slot, ReplayTick[] ticks, SubtickMove[] subs)
-            => BotController.LoadReplay(slot, ticks, subs);
+        public bool LoadReplay(
+            int slot,
+            ReplayTick[] ticks,
+            SubtickMove[] subs,
+            ReplayCommandFrame[] commands)
+            => BotController.LoadReplay(
+                slot, ticks, subs, commands, Array.Empty<ReplayMovementExtra>());
         public bool TransferRecordingToReplay(int srcSlot, int dstSlot)
             => BotController.TransferRecordingToReplay(srcSlot, dstSlot);
         // Registers the authoritative native pawn pointer for replay.
@@ -46,6 +55,29 @@ namespace BotControllerApi
         // Cancels one native usercmd injection by its token
         public bool CancelUsercmdInjection(int slot, long injectionId)
             => BotController.CancelUsercmdInjection(slot, injectionId);
+        // Creates an independently cancellable persistent analog movement override
+        public long StartUsercmdMovement(int slot, float forwardMove, float leftMove)
+            => BotController.StartUsercmdMovement(slot, forwardMove, leftMove);
+        // Updates one persistent analog movement override
+        public bool UpdateUsercmdMovement(
+            int slot,
+            long movementId,
+            float forwardMove,
+            float leftMove)
+            => BotController.UpdateUsercmdMovement(
+                slot, movementId, forwardMove, leftMove);
+        // Cancels one persistent analog movement override
+        public bool CancelUsercmdMovement(int slot, long movementId)
+            => BotController.CancelUsercmdMovement(slot, movementId);
+        // Suppresses selected usercmd buttons for a fixed duration
+        public bool SuppressUsercmd(int slot, ulong buttonMask, int durationMs)
+            => BotController.SuppressUsercmd(slot, buttonMask, durationMs);
+        // Creates an independently cancellable persistent native usercmd suppression
+        public long StartUsercmdSuppression(int slot, ulong buttonMask)
+            => BotController.StartUsercmdSuppression(slot, buttonMask);
+        // Cancels one persistent native usercmd suppression by its token
+        public bool CancelUsercmdSuppression(int slot, long suppressionId)
+            => BotController.CancelUsercmdSuppression(slot, suppressionId);
 
         // ---- profile ----
         public bool GetBotProfile(int slot, out BotProfileData profile)

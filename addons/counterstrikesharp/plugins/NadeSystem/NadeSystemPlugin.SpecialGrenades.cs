@@ -153,9 +153,8 @@ public partial class NadeSystemPlugin : BasePlugin
             if (Random.Shared.NextDouble() < 0.20)
             {
                 _defuseFlashUsed = true;
-                // Don't flash yourself — shorter window in humanlike mode.
-                float immuneSeconds = HumanlikeMode.Enabled ? 0.45f : 2f;
-                _botFlashImmunityUntil[(uint)bot.Index] = Server.CurrentTime + immuneSeconds;
+                // Don't flash yourself
+                _botFlashImmunityUntil[(uint)bot.Index] = Server.CurrentTime + 2f;
                 var flashVel = new Vector(0f, 0f, -800f);
                 TrySpawnInstantGrenade(bot, spawnPos, "flash", flashVel);
             }

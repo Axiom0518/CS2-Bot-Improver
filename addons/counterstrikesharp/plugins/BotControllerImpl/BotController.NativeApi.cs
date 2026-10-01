@@ -1,4 +1,4 @@
-// P/Invoke wrapper for BotController.dll (ABI 17), check IsCompatible() before use
+// P/Invoke wrapper for BotController.dll (ABI 22), check IsCompatible() before use
 // Main-thread only.
 
 using System.Runtime.InteropServices;
@@ -8,7 +8,7 @@ namespace BotControllerApi
     // Thin static binding over the native exports. No orchestration here.
     public static class BotController
     {
-        private const int ExpectedAbiVersion = 17;
+        private const int ExpectedAbiVersion = 22;
 
         // Sentinel weapon def meaning "any knife"
         public const int KnifeDef = 9001;
@@ -33,10 +33,40 @@ namespace BotControllerApi
         private static extern long BotController_InjectUsercmd(
             int slot, ulong buttonMask, int durationMs);
 
+        // Imports the persistent native analog movement export
+        [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
+        private static extern long BotController_StartUsercmdMovement(
+            int slot, float forwardMove, float leftMove);
+
+        // Imports the persistent native analog movement update export
+        [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int BotController_UpdateUsercmdMovement(
+            int slot, long movementId, float forwardMove, float leftMove);
+
+        // Imports the persistent native analog movement cancellation export
+        [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int BotController_CancelUsercmdMovement(
+            int slot, long movementId);
+
         // Imports the native usercmd injection cancellation export
         [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
         private static extern int BotController_CancelUsercmdInjection(
             int slot, long injectionId);
+
+        // Imports the native usercmd suppression export
+        [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int BotController_SuppressUsercmd(
+            int slot, ulong buttonMask, int durationMs);
+
+        // Imports the persistent native usercmd suppression export
+        [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
+        private static extern long BotController_StartUsercmdSuppression(
+            int slot, ulong buttonMask);
+
+        // Imports the persistent native usercmd suppression cancellation export
+        [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int BotController_CancelUsercmdSuppression(
+            int slot, long suppressionId);
 
         [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
         private static extern int BotController_StartRecord(int slot);
@@ -51,15 +81,34 @@ namespace BotControllerApi
         private static extern int BotController_GetRecordedSubtickCount(int slot);
 
         [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int BotController_GetRecordedCommandCount(int slot);
+
+        [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
         private static extern int BotController_CopyRecordedTicks(
             int slot, [Out] ReplayTick[] ticks, int maxTicks);
+
+        [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int BotController_CopyRecordedTicksRange(
+            int slot, int start, [Out] ReplayTick[] ticks, int maxTicks);
 
         [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
         private static extern int BotController_CopyRecordedSubticks(
             int slot, [Out] SubtickMove[] subs, int maxSubticks);
 
         [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
-        private static extern int BotController_LoadReplayExtended(
+        private static extern int BotController_CopyRecordedSubticksRange(
+            int slot, int start, [Out] SubtickMove[] subs, int maxSubticks);
+
+        [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int BotController_CopyRecordedCommands(
+            int slot, [Out] ReplayCommandFrame[] commands, int maxCommands);
+
+        [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int BotController_CopyRecordedCommandsRange(
+            int slot, int start, [Out] ReplayCommandFrame[] commands, int maxCommands);
+
+        [DllImport("BotController", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int BotController_LoadReplay(
             int slot, [In] ReplayTick[] ticks, int tickCount,
             [In] SubtickMove[] subs, int subCount,
             [In] ReplayCommandFrame[] commands, int commandCount,
@@ -149,6 +198,38 @@ namespace BotControllerApi
         public static bool CancelUsercmdInjection(int slot, long injectionId)
             => BotController_CancelUsercmdInjection(slot, injectionId) == 0;
 
+        // Creates an independently cancellable persistent analog movement override
+        public static long StartUsercmdMovement(
+            int slot,
+            float forwardMove,
+            float leftMove)
+            => BotController_StartUsercmdMovement(slot, forwardMove, leftMove);
+
+        // Updates one persistent analog movement override
+        public static bool UpdateUsercmdMovement(
+            int slot,
+            long movementId,
+            float forwardMove,
+            float leftMove)
+            => BotController_UpdateUsercmdMovement(
+                slot, movementId, forwardMove, leftMove) == 0;
+
+        // Cancels one persistent analog movement override
+        public static bool CancelUsercmdMovement(int slot, long movementId)
+            => BotController_CancelUsercmdMovement(slot, movementId) == 0;
+
+        // Suppresses selected usercmd buttons for a fixed duration
+        public static bool SuppressUsercmd(int slot, ulong buttonMask, int durationMs)
+            => BotController_SuppressUsercmd(slot, buttonMask, durationMs) == 0;
+
+        // Creates an independently cancellable persistent native usercmd suppression
+        public static long StartUsercmdSuppression(int slot, ulong buttonMask)
+            => BotController_StartUsercmdSuppression(slot, buttonMask);
+
+        // Cancels one persistent native usercmd suppression by its token
+        public static bool CancelUsercmdSuppression(int slot, long suppressionId)
+            => BotController_CancelUsercmdSuppression(slot, suppressionId) == 0;
+
         // ---- locks ----
 
         // All / Aim
@@ -181,15 +262,43 @@ namespace BotControllerApi
 
         public static int RecordedTickCount(int slot) => BotController_GetRecordedTickCount(slot);
 
+        // Copies one fixed-size range from a stopped recording.
+        public static int CopyRecordedTicksRange(int slot, int start, ReplayTick[] ticks)
+            => BotController_CopyRecordedTicksRange(slot, start, ticks, ticks.Length);
+
+        // Copies one fixed-size subtick range from a stopped recording.
+        public static int CopyRecordedSubticksRange(int slot, int start, SubtickMove[] subs)
+            => BotController_CopyRecordedSubticksRange(slot, start, subs, subs.Length);
+
+        // Copies one fixed-size command range from a stopped recording.
+        public static int CopyRecordedCommandsRange(int slot, int start, ReplayCommandFrame[] commands)
+            => BotController_CopyRecordedCommandsRange(slot, start, commands, commands.Length);
+
+        // Reports the size of the stopped recording's subtick buffer.
+        public static int RecordedSubtickCount(int slot) => BotController_GetRecordedSubtickCount(slot);
+
+        // Reports the size of the stopped recording's command buffer.
+        public static int RecordedCommandCount(int slot) => BotController_GetRecordedCommandCount(slot);
+
         // Pull a slot's recorded ticks + subticks out of native memory.
         public static (ReplayTick[] ticks, SubtickMove[] subs) GetRecordedMotion(int slot)
         {
+            var (ticks, subs, _) = GetRecordedMotionExtended(slot);
+            return (ticks, subs);
+        }
+
+        // Pull aligned tick, subtick, and command-frame buffers from native memory
+        public static (ReplayTick[] ticks, SubtickMove[] subs, ReplayCommandFrame[] commands)
+            GetRecordedMotionExtended(int slot)
+        {
             int nt = BotController_GetRecordedTickCount(slot);
-            if (nt <= 0) return (Array.Empty<ReplayTick>(), Array.Empty<SubtickMove>());
+            if (nt <= 0)
+                return (Array.Empty<ReplayTick>(), Array.Empty<SubtickMove>(), Array.Empty<ReplayCommandFrame>());
 
             var ticks = new ReplayTick[nt];
             int gotT = BotController_CopyRecordedTicks(slot, ticks, nt);
-            if (gotT <= 0) return (Array.Empty<ReplayTick>(), Array.Empty<SubtickMove>());
+            if (gotT <= 0)
+                return (Array.Empty<ReplayTick>(), Array.Empty<SubtickMove>(), Array.Empty<ReplayCommandFrame>());
             if (gotT != nt) Array.Resize(ref ticks, gotT);
 
             int ns = BotController_GetRecordedSubtickCount(slot);
@@ -203,27 +312,32 @@ namespace BotControllerApi
                 if (gotS <= 0) subs = Array.Empty<SubtickMove>();
                 else if (gotS != ns) Array.Resize(ref subs, gotS);
             }
-            return (ticks, subs);
+
+            int nc = BotController_GetRecordedCommandCount(slot);
+            ReplayCommandFrame[] commands;
+            if (nc <= 0)
+                commands = Array.Empty<ReplayCommandFrame>();
+            else
+            {
+                commands = new ReplayCommandFrame[nc];
+                int gotC = BotController_CopyRecordedCommands(slot, commands, nc);
+                if (gotC <= 0) commands = Array.Empty<ReplayCommandFrame>();
+                else if (gotC != nc) Array.Resize(ref commands, gotC);
+            }
+            return (ticks, subs, commands);
         }
 
         // ---- replay ----
 
-        // Load ticks + subticks into a slot's replay buffer (native copies in).
-        public static bool LoadReplay(int slot, ReplayTick[] ticks, SubtickMove[] subs)
-            => LoadReplayExtended(
-                slot, ticks, subs,
-                Array.Empty<ReplayCommandFrame>(),
-                Array.Empty<ReplayMovementExtra>());
-
-        // Load replay buffers with optional per-tick command and movement data
-        public static bool LoadReplayExtended(
+        // Load replay buffers with optional per-tick command and movement data.
+        public static bool LoadReplay(
             int slot,
             ReplayTick[] ticks,
             SubtickMove[] subs,
             ReplayCommandFrame[] commands,
             ReplayMovementExtra[] movementExtras)
             => ticks is { Length: > 0 }
-               && BotController_LoadReplayExtended(
+               && BotController_LoadReplay(
                    slot,
                    ticks,
                    ticks.Length,

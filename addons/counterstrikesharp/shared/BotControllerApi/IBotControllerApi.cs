@@ -35,10 +35,18 @@ namespace BotControllerApi
         // Pull a slot's recorded ticks + subticks out of memory.
         (ReplayTick[] ticks, SubtickMove[] subs) GetRecordedMotion(int slot);
 
+        // Pull aligned tick, subtick, and command-frame buffers out of memory
+        (ReplayTick[] ticks, SubtickMove[] subs, ReplayCommandFrame[] commands)
+            GetRecordedMotionExtended(int slot);
+
         // ---- replay ----
 
-        // Load ticks + subticks into a slot's replay buffer.
-        bool LoadReplay(int slot, ReplayTick[] ticks, SubtickMove[] subs);
+        // Load ticks, subticks, and aligned command frames into a replay buffer.
+        bool LoadReplay(
+            int slot,
+            ReplayTick[] ticks,
+            SubtickMove[] subs,
+            ReplayCommandFrame[] commands);
 
         // Move a slot's just-recorded buffers into another slot's replay buffer.
         bool TransferRecordingToReplay(int srcSlot, int dstSlot);
@@ -72,6 +80,28 @@ namespace BotControllerApi
 
         // Cancels one usercmd injection by its token
         bool CancelUsercmdInjection(int slot, long injectionId);
+
+        // Creates an independently cancellable persistent analog movement override
+        long StartUsercmdMovement(int slot, float forwardMove, float leftMove);
+
+        // Updates one persistent analog movement override
+        bool UpdateUsercmdMovement(
+            int slot,
+            long movementId,
+            float forwardMove,
+            float leftMove);
+
+        // Cancels one persistent analog movement override
+        bool CancelUsercmdMovement(int slot, long movementId);
+
+        // Suppresses selected usercmd buttons for a fixed duration
+        bool SuppressUsercmd(int slot, ulong buttonMask, int durationMs);
+
+        // Creates an independently cancellable persistent usercmd suppression
+        long StartUsercmdSuppression(int slot, ulong buttonMask);
+
+        // Cancels one persistent usercmd suppression by its token
+        bool CancelUsercmdSuppression(int slot, long suppressionId);
 
         // ---- profile ----
 

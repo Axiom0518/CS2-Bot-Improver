@@ -26,7 +26,6 @@ namespace BotControllerApi
         Slot5 = 5,
     }
 
-    /** One boundary of a movement tick. Captured pre (before mover) and post (after) */
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
     public struct MovementSnapshot
     {
@@ -50,7 +49,6 @@ namespace BotControllerApi
         public byte ActualMoveType; // m_nActualMoveType
     }
 
-    /** One recorded server tick. Must match C++ ReplayTick byte layout exactly */
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
     public struct ReplayTick
     {
@@ -58,9 +56,24 @@ namespace BotControllerApi
         public MovementSnapshot Post;
         public int WeaponDefIndex;
         public uint NumSubtick;
+        public uint EventFlags;
+        public int EventWeaponDefIndex;
+        public uint EventDropVectorFlags;
+        public float EventDropTargetX;
+        public float EventDropTargetY;
+        public float EventDropTargetZ;
+        public float EventDropVelocityX;
+        public float EventDropVelocityY;
+        public float EventDropVelocityZ;
+        public float EventDropReleaseX;
+        public float EventDropReleaseY;
+        public float EventDropReleaseZ;
+        public float EventDropReleaseQuatX;
+        public float EventDropReleaseQuatY;
+        public float EventDropReleaseQuatZ;
+        public float EventDropReleaseQuatW;
     }
 
-    /** One subtick input step. Must match C++ SubtickMove byte layout exactly */
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
     public struct SubtickMove
     {
@@ -73,7 +86,6 @@ namespace BotControllerApi
         public float YawDelta;
     }
 
-    /** Optional replay usercmd frame. Must match C++ ReplayCommandFrameData */
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
     public struct ReplayCommandFrame
     {
@@ -96,7 +108,6 @@ namespace BotControllerApi
         public byte Pad2;
     }
 
-    /** Optional offset-backed replay movement state. Must match C++ ReplayMovementExtra */
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
     public struct ReplayMovementExtra
     {
@@ -114,7 +125,6 @@ namespace BotControllerApi
         public float LastLandedVelocityZ;
     }
 
-    /** Bot personality / aim / weapon preference. Mirrors C++ BotProfileData */
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
     public struct BotProfileData
     {
