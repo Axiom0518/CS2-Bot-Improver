@@ -93,7 +93,7 @@ public class BotAimImprover : BasePlugin
     // ============================================================
     // Platform-specific memory layout (PickNewAimSpot hook + CCSBot fields).
     //   Linux  libserver.so 2026-05-28
-    //   Windows server.dll  2026-07-09
+    //   Windows server.dll  1.41.8.8 (schema 2026-10-01)
     // ============================================================
     private readonly struct Offsets
     {
@@ -117,10 +117,10 @@ public class BotAimImprover : BasePlugin
         sig: "55 48 89 E5 41 55 41 54 53 48 89 FB 48 83 EC 58 8B 8F ? ? 00 00 83 F9 FF");
 
     private static readonly Offsets WindowsOffsets = new(
-        ts: 0x599C,
-        en: 0x5A08,
-        vis: 0x5A0C,
-        pbot: 0x12C0,
+        ts: 0x5994,
+        en: 0x5A00,
+        vis: 0x5A04,
+        pbot: 0x1510,
         sig: "48 8B C4 55 57 48 8D 68 ? 48 81 EC ? ? ? ? 48 8B F9 0F 29 70 ? 8B 89 ? ? ? ? 83 F9 FF"
     );
 
