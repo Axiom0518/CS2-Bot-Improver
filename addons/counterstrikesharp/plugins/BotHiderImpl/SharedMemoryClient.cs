@@ -11,15 +11,15 @@ namespace BotHiderImpl;
 // src/slot_shm.h
 public sealed class SharedMemoryClient : IBotHiderApi, IDisposable
 {
-    private const string MappingName = "CS2BotHider_Slots";
-    private const string PosixMappingPath = "/dev/shm/CS2BotHider_Slots";
+    private static readonly string MappingName = "CS2BotHider_Slots_" + Environment.ProcessId.ToString(CultureInfo.InvariantCulture);
+    private static readonly string LinuxMappingTarget = "/memfd:" + MappingName + " (deleted)";
     private const uint Magic = 0x44494842; // 'BHID'
     private const uint Version = 1;
     private const int MaxSlots = 64;
     private const int NameLen = 32;
     private const int CmdCount = 64;
     private const int AvatarMaxBytes = 16 * 1024;
-    private const int TotalSize = 1_064_960;
+    private const int TotalSize = 1_073_408;
     private static readonly byte[] AvatarPngSignature =
         [0x89, (byte)'P', (byte)'N', (byte)'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
@@ -52,7 +52,12 @@ public sealed class SharedMemoryClient : IBotHiderApi, IDisposable
     private const int OffAvatarIncarnation = 14240;  // uint64[64]
     private const int OffAvatarApplied = 14752;  // byte[64]
     private const int OffAvatarAppliedSid = 14816;  // uint64[64]
+    private const int OffCommandIncarnation = 15328; // uint64[CmdCount]
     private const int OffAvatarData = 16384;  // byte[64][16 KiB]
+    // Configured clan presentation region
+    private const int OffClanGroupId = 1_064_960; // uint32[64]
+    private const int OffClanTag = 1_065_216; // char[64][128]
+    private const int ClanTagLen = 128;
 
     // Command region offsets
     private const int OffWriteIdx = 2640;
@@ -73,24 +78,25 @@ public sealed class SharedMemoryClient : IBotHiderApi, IDisposable
     private MemoryMappedViewAccessor? _view;
     private readonly object _writeLock = new();
 
-    private readonly Action<int, string>? _onVisibleName;
+    private readonly Action<int, string, ulong>? _onVisibleName;
 
-    private readonly Action<int, ulong>? _onVisibleSid;
-    private readonly Action<int, uint>? _onScoreboardFlair;
-    private readonly Action<int, string>? _onCrosshairCode;
+    private readonly Action<int, ulong>? _onSteamIdQueued;
+    private readonly Action<int, uint, ulong>? _onScoreboardFlair;
+    private readonly Action<int, string, ulong>? _onCrosshairCode;
     private readonly string?[] _personaNameOverrides = new string?[MaxSlots];
     private readonly ulong[] _personaNameOverrideIncarnations = new ulong[MaxSlots];
     private readonly uint[] _scoreboardFlairs = new uint[MaxSlots];
     private readonly bool[] _scoreboardFlairAssigned = new bool[MaxSlots];
     private readonly ulong[] _scoreboardFlairIncarnations = new ulong[MaxSlots];
 
-    public SharedMemoryClient(Action<int, string>? onVisibleName = null,
-                              Action<int, ulong>? onVisibleSid = null,
-                              Action<int, uint>? onScoreboardFlair = null,
-                              Action<int, string>? onCrosshairCode = null)
+    // Captures presentation callbacks that retain the queued slot lifetime.
+    public SharedMemoryClient(Action<int, string, ulong>? onVisibleName = null,
+                              Action<int, ulong>? onSteamIdQueued = null,
+                              Action<int, uint, ulong>? onScoreboardFlair = null,
+                              Action<int, string, ulong>? onCrosshairCode = null)
     {
         _onVisibleName = onVisibleName;
-        _onVisibleSid = onVisibleSid;
+        _onSteamIdQueued = onSteamIdQueued;
         _onScoreboardFlair = onScoreboardFlair;
         _onCrosshairCode = onCrosshairCode;
     }
@@ -103,8 +109,7 @@ public sealed class SharedMemoryClient : IBotHiderApi, IDisposable
         {
             _mmf = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
                 ? MemoryMappedFile.OpenExisting(MappingName, MemoryMappedFileRights.ReadWrite)
-                : MemoryMappedFile.CreateFromFile(PosixMappingPath, FileMode.Open, null,
-                    TotalSize, MemoryMappedFileAccess.ReadWrite);
+                : OpenLinuxMapping();
             _view = _mmf.CreateViewAccessor(0, TotalSize,
                 MemoryMappedFileAccess.ReadWrite);
             if (_view.ReadUInt32(OffMagic) != Magic ||
@@ -120,11 +125,19 @@ public sealed class SharedMemoryClient : IBotHiderApi, IDisposable
         catch (Exception) { Dispose(); return false; }
     }
 
-    private bool Valid(int slot)
+    // Reopens the native memfd without taking ownership of its original descriptor.
+    private static MemoryMappedFile OpenLinuxMapping()
     {
-        if (_view == null) TryConnect();
-        return _view != null && slot >= 0 && slot < MaxSlots;
+        foreach (string path in Directory.EnumerateFiles("/proc/self/fd"))
+        {
+            if (new FileInfo(path).LinkTarget != LinuxMappingTarget) continue;
+            return MemoryMappedFile.CreateFromFile(path, FileMode.Open, null,
+                TotalSize, MemoryMappedFileAccess.ReadWrite);
+        }
+        throw new FileNotFoundException("BotHider's native memfd is not available.");
     }
+
+    private bool Valid(int slot) => _view != null && slot >= 0 && slot < MaxSlots;
 
     // Returns whether the shared memory bridge is connected
     public bool IsConnected()
@@ -201,6 +214,13 @@ public sealed class SharedMemoryClient : IBotHiderApi, IDisposable
     public string GetCrosshairCode(int slot)
         => ReadFixedUtf8(slot, OffCrosshair, CrosshairLen);
 
+    // Returns the configured clan pair for the selected native identity.
+    public (string Tag, uint GroupId) GetClan(int slot)
+        => IsManagedBot(slot)
+            ? (ReadFixedUtf8(slot, OffClanTag, ClanTagLen),
+               _view!.ReadUInt32(OffClanGroupId + slot * sizeof(uint)))
+            : (string.Empty, 0);
+
     // Returns whether native has applied an avatar to the current SteamID
     public bool HasBotAvatar(int slot)
     {
@@ -225,11 +245,13 @@ public sealed class SharedMemoryClient : IBotHiderApi, IDisposable
     // Write crosshair code to shared memory, empty or "0" to clear
     public bool SetCrosshairCode(int slot, string code)
     {
-        if (!Valid(slot)) return false;
+        if (!IsManagedBot(slot)) return false;
+        ulong incarnation = GetSlotIncarnation(slot);
+        if (incarnation == 0) return false;
         if (code == "0") code = string.Empty;
         if (!TryEncodeFixedUtf8(code, CrosshairLen, out var buf)) return false;
         _view!.WriteArray(OffCrosshair + slot * CrosshairLen, buf, 0, CrosshairLen);
-        _onCrosshairCode?.Invoke(slot, code);
+        _onCrosshairCode?.Invoke(slot, code, incarnation);
         return true;
     }
 
@@ -272,29 +294,27 @@ public sealed class SharedMemoryClient : IBotHiderApi, IDisposable
 
     // IBotHiderApi: write side
 
+    // Queues a SteamID request without exposing an unconfirmed display value.
     public bool SetBotSteamId(int slot, ulong steamId64)
     {
         if (!Valid(slot)) return false;
-        bool ok = PostCommand(CmdSetSteamId, slot, steamId64, null);
-        if (ok) _onVisibleSid?.Invoke(slot, steamId64);
+        bool ok = PostCommand(CmdSetSteamId, slot, steamId64, null, out ulong incarnation);
+        if (ok) _onSteamIdQueued?.Invoke(slot, incarnation);
         return ok;
     }
 
+    // Associates the name override and deferred write with the queued lifetime.
     public bool SetPersonaName(int slot, string name)
     {
         if (!Valid(slot)) return false;
         string normalizedName = BuildBoundedVisiblePersonaName(name);
         if (normalizedName.Length == 0) return false;
-        bool ok = PostCommand(CmdSetPersona, slot, 0UL, normalizedName);
+        bool ok = PostCommand(CmdSetPersona, slot, 0UL, normalizedName, out ulong incarnation);
         if (ok)
         {
-            ulong incarnation = GetSlotIncarnation(slot);
-            if (incarnation != 0)
-            {
-                _personaNameOverrides[slot] = normalizedName;
-                _personaNameOverrideIncarnations[slot] = incarnation;
-            }
-            _onVisibleName?.Invoke(slot, normalizedName);
+            _personaNameOverrides[slot] = normalizedName;
+            _personaNameOverrideIncarnations[slot] = incarnation;
+            _onVisibleName?.Invoke(slot, normalizedName, incarnation);
         }
         return ok;
     }
@@ -397,7 +417,7 @@ public sealed class SharedMemoryClient : IBotHiderApi, IDisposable
         _scoreboardFlairs[slot] = itemDefIndex;
         _scoreboardFlairAssigned[slot] = true;
         _scoreboardFlairIncarnations[slot] = incarnation;
-        _onScoreboardFlair?.Invoke(slot, itemDefIndex);
+        _onScoreboardFlair?.Invoke(slot, itemDefIndex, incarnation);
         return true;
     }
 
@@ -407,7 +427,7 @@ public sealed class SharedMemoryClient : IBotHiderApi, IDisposable
         if (mode is not BotIdentityMode.Player and not BotIdentityMode.Bot) return false;
         if (_view == null) TryConnect();
         if (_view == null) return false;
-        return PostCommand(CmdSetIdentityMode, SlotAll, (ulong)mode, null);
+        return PostCommand(CmdSetIdentityMode, SlotAll, (ulong)mode, null, out _);
     }
 
     // Global display-name source toggle (1=bot_info name, 0=botprofile name)
@@ -415,16 +435,24 @@ public sealed class SharedMemoryClient : IBotHiderApi, IDisposable
     {
         if (_view == null) TryConnect();
         if (_view == null) return false;
-        return PostCommand(CmdSetNameSource, SlotAll, useBotInfo ? 1UL : 0UL, null);
+        return PostCommand(CmdSetNameSource, SlotAll, useBotInfo ? 1UL : 0UL, null, out _);
     }
 
-    private bool PostCommand(byte type, int slot, ulong sid, string? name)
+    // Returns the same incarnation stamped into the native command queue.
+    private bool PostCommand(byte type, int slot, ulong sid, string? name, out ulong incarnation)
     {
+        incarnation = 0;
         if (_view == null) return false;
         if (!TryEncodeFixedUtf8(name ?? string.Empty, NameLen, out var nameBuf))
             return false;
         lock (_writeLock)
         {
+            if (slot != SlotAll)
+            {
+                if (!IsManagedBot(slot)) return false;
+                incarnation = GetSlotIncarnation(slot);
+                if (incarnation == 0) return false;
+            }
             uint w = _view.ReadUInt32(OffWriteIdx);
             uint r = _view.ReadUInt32(OffReadIdx);
             if (unchecked(w - r) >= CmdCount)
@@ -435,6 +463,7 @@ public sealed class SharedMemoryClient : IBotHiderApi, IDisposable
             _view.Write(baseOff + 1, (byte)slot);
             _view.Write(baseOff + 8, sid);
             _view.WriteArray(baseOff + 16, nameBuf, 0, NameLen);
+            _view.Write(OffCommandIncarnation + (int)(w % CmdCount) * sizeof(ulong), incarnation);
 
             Interlocked.MemoryBarrier();
             _view.Write(OffWriteIdx, w + 1);

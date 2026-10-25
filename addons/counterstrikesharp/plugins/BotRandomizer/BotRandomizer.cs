@@ -25,7 +25,7 @@ public sealed class BotRandomizerPlugin : BasePlugin
     private bool _giveNamedItemErrorLogged;
 
     public override string ModuleName => "BotRandomizer";
-    public override string ModuleVersion => "1.3.2";
+    public override string ModuleVersion => "1.3.3";
     public override string ModuleAuthor => "ed0ard, Misaka17032, unicbm & XBribo";
     public override string ModuleDescription =>
         "Stable per-bot knives, gloves, weapon skins, stickers, charms, agents and music kits";
@@ -119,7 +119,7 @@ public sealed class BotRandomizerPlugin : BasePlugin
                 // CEconItemViewConstructor
                 itemViewConstructor = new MemoryFunctionWithReturn<nint, nint>(
                     RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
-                        ? "55 48 8D 05 ? ? ? ? 66 0F EF C0 48 89 E5 41 57 45 31 FF"
+                        ? "55 48 8D 05 ? ? ? ? 66 0F EF C0 48 89 E5 41 57 41 56 4C 8D 35 ? ? ? ? 41 55 41 54 45 31 E4"
                         : "48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 57 41 54 41 55 41 56 41 57 48 83 EC ? 48 8B F9 48 8D 05");
             }
             catch (Exception exception)

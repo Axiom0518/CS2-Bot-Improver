@@ -1,10 +1,10 @@
 {
   "source": {
     "repository": "ianlucas/cs2-lib",
-    "commit": "8e486bf2f63b191bb1777c1684ed330c603561a3",
+    "commit": "527e05dbeb77c37cda16e9d8aed68bf96f62a92b",
     "package": "@ianlucas/cs2-lib",
-    "version": "9.4.0",
-    "integrity": "sha512-zpXzT1JK/fwFJgISFj8SfVo2EH6467UV5XFloUepmBIxdmttN4kNPb3oHb4JBE25blQOY9om1qjfE8CMp9vcjg=="
+    "version": "9.8.0",
+    "integrity": "sha512-WQd1yE1E8DMUnLQ/l2NwmMqpRYoJFcX7TsbDxplg+lyY4IiyousC2DKNcd7Sqsn9FNYwCd/7aLLfbzxs/1GLrQ=="
   },
   "weapons": [
     {

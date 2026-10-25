@@ -201,7 +201,7 @@ public partial class BotState : BasePlugin
 
 	private readonly Dictionary<int, float> _stuckStartTime = new Dictionary<int, float>();
 
-	private readonly Dictionary<int, Vector> _stuckStartPos = new Dictionary<int, Vector>();
+	private readonly Dictionary<int, (float X, float Y)> _stuckStartPos = new Dictionary<int, (float X, float Y)>();
 
 	private readonly Dictionary<int, bool> _stuckJumpDone = new Dictionary<int, bool>();
 
@@ -257,7 +257,7 @@ public partial class BotState : BasePlugin
 
 	public override string ModuleName => "Smarter-Bot";
 
-	public override string ModuleVersion => "1.10.0";
+	public override string ModuleVersion => "1.10.4";
 
 	public override string ModuleAuthor => "ed0ard & XBribo & unicbm";
 
@@ -1298,6 +1298,11 @@ public partial class BotState : BasePlugin
 		((BasePlugin)this).RegisterEventHandler<EventDoorClose>((GameEventHandler<EventDoorClose>)OnDoorClose, (HookMode)1);
 		((BasePlugin)this).RegisterEventHandler<EventWeaponFire>((GameEventHandler<EventWeaponFire>)OnWeaponFire, (HookMode)1);
 		((BasePlugin)this).RegisterEventHandler<EventPlayerDeath>((GameEventHandler<EventPlayerDeath>)OnPlayerDeath, (HookMode)1);
+		RegisterListener<Listeners.OnEntityCreated>(InvalidateFlashEntities);
+		RegisterListener<Listeners.OnEntitySpawned>(InvalidateFlashEntities);
+		RegisterListener<Listeners.OnEntityDeleted>(InvalidateFlashEntities);
+		RegisterListener<Listeners.OnMapStart>(_ => ClearFlashEntities());
+		RegisterListener<Listeners.OnMapEnd>(ClearFlashEntities);
 		((BasePlugin)this).RegisterListener<OnTick>((OnTick)OnTick);
 		_gunReequipTimer = ((BasePlugin)this).AddTimer(1f, (Action)ReequipGunForActiveBots, (TimerFlags?)(TimerFlags)1);
 		StartRushAntennaPublisher();
@@ -1327,6 +1332,7 @@ public partial class BotState : BasePlugin
 		_customFov?.Dispose();
 		_customFov = null;
 		ClearFovObservers();
+		ClearFlashEntities();
 		CancelAllFakeDefuseSuppressions();
 		UninstallBotBlindHook();
 		UninstallDefuseBombHook();
@@ -1565,7 +1571,7 @@ public partial class BotState : BasePlugin
 			if (!_stuckStartTime.ContainsKey(idx))
 			{
 				_stuckStartTime[idx] = now;
-				_stuckStartPos[idx] = new Vector((float?)absOrigin.X, (float?)absOrigin.Y, (float?)absOrigin.Z);
+				_stuckStartPos[idx] = (absOrigin.X, absOrigin.Y);
 				_stuckJumpDone[idx] = false;
 				_stuckMaxSpeed[idx] = 0f;
 			}
@@ -1574,7 +1580,7 @@ public partial class BotState : BasePlugin
 				_stuckMaxSpeed[idx] = num;
 			}
 			float num2 = now - _stuckStartTime.GetValueOrDefault(idx);
-			Vector valueOrDefault = _stuckStartPos.GetValueOrDefault(idx, new Vector((float?)absOrigin.X, (float?)absOrigin.Y, (float?)absOrigin.Z));
+			var valueOrDefault = _stuckStartPos.GetValueOrDefault(idx, (absOrigin.X, absOrigin.Y));
 			float num3 = MathF.Sqrt(MathF.Pow(absOrigin.X - valueOrDefault.X, 2f) + MathF.Pow(absOrigin.Y - valueOrDefault.Y, 2f));
 			float valueOrDefault2 = _stuckMaxSpeed.GetValueOrDefault(idx);
 			bool flag = num2 >= 1f && valueOrDefault2 <= 10f;
@@ -1595,7 +1601,7 @@ public partial class BotState : BasePlugin
 				repathTimer.Timestamp = Server.CurrentTime;
 				repathTimer.Timescale = 1f;
 				_stuckStartTime[idx] = now;
-				_stuckStartPos[idx] = new Vector((float?)absOrigin.X, (float?)absOrigin.Y, (float?)absOrigin.Z);
+				_stuckStartPos[idx] = (absOrigin.X, absOrigin.Y);
 				_stuckMaxSpeed[idx] = 0f;
 			}
 			return;
@@ -2000,9 +2006,11 @@ public partial class BotState : BasePlugin
 	{
 		ProcessFlashbangAvoidance();
 		ExpireReveals(Server.CurrentTime);
-		foreach (CCSPlayerController item in Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller"))
+		int maxPlayers = NativeAPI.GetMaxClients();
+		for (int slot = 0; slot < maxPlayers; slot++)
 		{
-			if (!((CEntityInstance)item).IsValid || !item.IsBot)
+			var item = Utilities.GetPlayerFromSlot(slot);
+			if (item == null || !((CEntityInstance)item).IsValid || !item.IsBot)
 			{
 				continue;
 			}

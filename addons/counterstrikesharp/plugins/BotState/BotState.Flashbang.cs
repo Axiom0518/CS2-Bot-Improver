@@ -24,6 +24,9 @@ public partial class BotState
 
     private bool _smokeConfigLoaded;
     private Vector? _scratchEye;
+    private readonly List<CHandle<CBaseEntity>> _flashProjectiles = new();
+    private readonly List<CHandle<CCSPlayerController>> _flashControllers = new();
+    private bool _flashEntitiesDirty = true;
 
     private MemoryFunctionVoid<nint, float, float, float>? _botBlindFunction;
 
@@ -306,6 +309,36 @@ public partial class BotState
         return null;
     }
 
+    // Entity lifecycle notifications only invalidate discovery; positions and visibility
+    // are still read every tick. Rebuild in native entity-list order to preserve roll order.
+    private void InvalidateFlashEntities(CEntityInstance entity) => _flashEntitiesDirty = true;
+
+    private void ClearFlashEntities()
+    {
+        _flashProjectiles.Clear();
+        _flashControllers.Clear();
+        _flashEntitiesDirty = true;
+    }
+
+    private void RefreshFlashEntities()
+    {
+        if (!_flashEntitiesDirty) return;
+
+        _flashProjectiles.Clear();
+        foreach (var entity in Utilities.FindAllEntitiesByDesignerName<CBaseEntity>("flashbang_projectile"))
+        {
+            if (entity.IsValid)
+                _flashProjectiles.Add(new CHandle<CBaseEntity>(entity.EntityHandle.Raw));
+        }
+        _flashControllers.Clear();
+        foreach (var controller in Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller"))
+        {
+            if (controller.IsValid)
+                _flashControllers.Add(new CHandle<CCSPlayerController>(controller.EntityHandle.Raw));
+        }
+        _flashEntitiesDirty = false;
+    }
+
     // Player-like flash (realism over sweat):
     //   perceive 200–260ms → fight normally → flick away 130–170ms before boom →
     //   HOLD away 100–160ms after boom → look back 120–180ms → release.
@@ -323,10 +356,12 @@ public partial class BotState
         float dt = Server.TickInterval > 0f ? Server.TickInterval : 0.015625f;
         bool humanlike = true;
 
+        RefreshFlashEntities();
         var live = new Dictionary<uint, (Vector pos, float detonateAt)>();
-        foreach (var ent in Utilities.FindAllEntitiesByDesignerName<CBaseEntity>("flashbang_projectile"))
+        foreach (var handle in _flashProjectiles)
         {
-            if (!ent.IsValid) continue;
+            var ent = handle.Value;
+            if (ent == null || !ent.IsValid) continue;
             var pos = ent.AbsOrigin;
             if (pos == null) continue;
 
@@ -364,9 +399,10 @@ public partial class BotState
         // Refresh planted windows; cleared bots drop out below.
         var plantedActive = new HashSet<int>();
 
-        foreach (var bot in Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller"))
+        foreach (var handle in _flashControllers)
         {
-            if (!bot.IsValid || !bot.IsBot) continue;
+            var bot = handle.Value;
+            if (bot == null || !bot.IsValid || !bot.IsBot) continue;
             if (bot.HasBeenControlledByPlayerThisRound) continue;
 
             var pawn = bot.PlayerPawn?.Value;
