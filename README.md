@@ -40,7 +40,7 @@ Download the package for your operating system from the **[latest release](https
 > [!NOTE]
 > Running a dedicated server that is not only for bot matches?  
 On Windows, please download **CS2BotImprover_rules_unchanged.zip** to preserve the standard game rules.
-2. Move **Panel v1.4.7.exe** somewhere convenient.
+2. Move **Panelv1.4.7.exe** somewhere convenient.
 
    <img width="128" height="128" alt="CS2 Bot Improver Panel application icon" src="https://github.com/user-attachments/assets/7271dc7d-2436-484b-8359-6531f4abd710" />
 
